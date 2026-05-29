@@ -1,17 +1,18 @@
 """collector.py — Claude Code usage collector for end-user machines.
 
-Scans Claude Code JSONL transcripts, uploads raw files to Supabase Storage,
-and posts parsed metadata to the dashboard server. Designed to run silently
-on a Windows Scheduled Task every 15 minutes.
+Postgres-only mode (v1.2+): scans Claude Code JSONL transcripts, parses each
+user/assistant message into structured data, and POSTs the whole batch to
+the dashboard server's /api/ingest endpoint. No Supabase Storage uploads,
+no signed-URL dance, no SHA-256 hashing.
 
-Stdlib-only so PyInstaller produces a small, single-file .exe (no native
-deps to ship). Talks to the server via HTTPS only — never Supabase directly.
+Designed to run silently on a Windows Scheduled Task every 15 minutes.
+Stdlib-only so PyInstaller produces a small, single-file .exe.
 
 Run manually for testing:
 
     python collector.py push                # one-shot push of new data
-    python collector.py status              # show state + config, no upload
-    python collector.py reset-state         # forget upload history (re-upload)
+    python collector.py status              # show state + config, no push
+    python collector.py reset-state         # forget push history (re-push)
 
 Reads config from (first match wins):
   1.  --config <path>
@@ -30,10 +31,9 @@ import json
 import os
 import socket
 import sys
-import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib import request as urlrequest
@@ -43,12 +43,15 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.0"
+USER_AGENT = "claude-usage-collector/1.2"
 DEFAULT_PROJECTS_DIRS = [
     Path.home() / ".claude" / "projects",
     Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects",
 ]
-INGEST_BATCH_SIZE = 100   # turns per POST /api/ingest call (keeps body < 4.5 MB)
+# Smaller than v1.x because each record now carries full message content.
+# At ~5 KB/turn avg, 50 turns + 100 records ≈ 750 KB payload, well under
+# Vercel's 4.5 MB request body limit.
+INGEST_BATCH_SIZE = 50
 HTTP_TIMEOUT_S = 60
 
 
@@ -82,7 +85,6 @@ def load_config(override: Optional[str] = None) -> Tuple[Dict[str, Any], Path]:
         if p.is_file():
             with open(p, encoding="utf-8") as f:
                 cfg = json.load(f)
-            # Apply env-var overrides (useful for local testing).
             cfg.setdefault("server_url",   os.environ.get("SERVER_URL"))
             cfg.setdefault("ingest_token", os.environ.get("INGEST_TOKEN"))
             return cfg, p
@@ -92,11 +94,13 @@ def load_config(override: Optional[str] = None) -> Tuple[Dict[str, Any], Path]:
     )
 
 
-# ── Local state (what we've uploaded) ───────────────────────────────────────
+# ── Local state ─────────────────────────────────────────────────────────────
+# Per-file we track mtime (cheap "did anything change?" check) and lines
+# (how many lines we've already sent — so a growing file only sends the
+# new tail next time, no duplicate user/assistant message rows on the
+# server side). content_hash from v1.x is retained for safety but unused.
 
 def _state_path() -> Path:
-    """Per-machine state file. Lives in %LOCALAPPDATA% so it persists across
-    installs and doesn't need admin rights to write."""
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
     p = Path(base) / APP_NAME / "state.json"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -123,12 +127,9 @@ def save_state(state: Dict[str, Any]) -> None:
 
 
 def _make_machine_fp() -> str:
-    """Stable per-machine identifier.
-
-    uuid.getnode() returns the MAC address as a 48-bit int when one is found,
-    otherwise a random value. We combine with the hostname so re-imaged
-    machines (new MAC) still group differently from a coworker's box.
-    """
+    """Stable per-machine identifier (sha256 of hostname + MAC). New MAC after
+    a re-image will produce a new fp — intentional, since it's effectively
+    a different machine."""
     raw = f"{socket.gethostname()}|{uuid.getnode():012x}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
@@ -136,8 +137,6 @@ def _make_machine_fp() -> str:
 # ── Identification ──────────────────────────────────────────────────────────
 
 def detect_user() -> Dict[str, str]:
-    # getpass.getuser() consults LOGNAME/USER/LNAME/USERNAME env vars,
-    # which is what we want — matches how the user knows themselves.
     import getpass
     return {"os_username": (getpass.getuser() or "unknown").strip()}
 
@@ -150,7 +149,7 @@ def detect_machine(machine_fp: str) -> Dict[str, str]:
     }
 
 
-# ── JSONL parsing (mirror of scanner.py) ────────────────────────────────────
+# ── JSONL parsing ───────────────────────────────────────────────────────────
 
 MODEL_PRIORITY = {"opus": 3, "sonnet": 2, "haiku": 1}
 
@@ -174,16 +173,41 @@ def _project_name_from_cwd(cwd: str) -> str:
     return parts[-1] if parts else "unknown"
 
 
-def parse_jsonl_file(filepath: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
-    """Same dedup-by-message_id logic as scanner.parse_jsonl_file."""
+def parse_jsonl_file(
+    filepath: str,
+    skip_lines: int = 0,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """Parse a JSONL file. Returns (session_metas, turns, records, line_count).
+
+    Session metadata is derived from ALL lines (a full scan is cheap and gives
+    us accurate first/last timestamps even if we're only sending the tail).
+
+    Turns and records are emitted only from lines > skip_lines so resumed
+    pushes don't re-send already-ingested content. If the file's current
+    line count is *less* than skip_lines, the file was truncated/rewritten —
+    re-parse everything.
+    """
     seen_messages: Dict[str, Dict[str, Any]] = {}
     turns_no_id: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
     session_meta: Dict[str, Dict[str, Any]] = {}
     line_count = 0
 
+    # First pass: count lines to detect truncation
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
-            for line_count, line in enumerate(f, 1):
+            for total in f:
+                line_count += 1
+    except Exception:
+        return [], [], [], 0
+
+    if line_count < skip_lines:
+        # File shrank — assume rewrite, re-parse everything
+        skip_lines = 0
+
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for idx, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
@@ -203,6 +227,7 @@ def parse_jsonl_file(filepath: str) -> Tuple[List[Dict[str, Any]], List[Dict[str
                 cwd = record.get("cwd", "")
                 git_branch = record.get("gitBranch", "")
 
+                # Session metadata always tracked (cheap, gives accurate ranges).
                 if session_id not in session_meta:
                     session_meta[session_id] = {
                         "session_uuid":    session_id,
@@ -221,18 +246,43 @@ def parse_jsonl_file(filepath: str) -> Tuple[List[Dict[str, Any]], List[Dict[str
                     if git_branch and not meta["git_branch"]:
                         meta["git_branch"] = git_branch
 
+                # Skip turn/record emission for already-processed lines.
+                if idx <= skip_lines:
+                    if rtype == "assistant":
+                        msg = record.get("message", {})
+                        model = msg.get("model", "")
+                        if model:
+                            prev = session_meta[session_id]["model"]
+                            if _model_priority(model) > _model_priority(prev):
+                                session_meta[session_id]["model"] = model
+                            elif not prev:
+                                session_meta[session_id]["model"] = model
+                    continue
+
+                # Always emit the record (for /api/ingest -> messages table).
+                # Strip down to the fields the server actually needs to keep
+                # the payload reasonable.
+                msg = record.get("message", {}) or {}
+                msg_id = msg.get("id") if rtype == "assistant" else None
+                records.append({
+                    "session_uuid": session_id,
+                    "type":         rtype,
+                    "timestamp":    timestamp,
+                    "message_uuid": msg_id,
+                    "message":      msg,
+                })
+
                 if rtype == "assistant":
-                    msg = record.get("message", {})
-                    usage = msg.get("usage", {})
+                    usage = msg.get("usage", {}) or {}
                     model = msg.get("model", "")
-                    message_id = msg.get("id", "")
+                    message_id = msg_id or ""
 
                     inp = usage.get("input_tokens", 0) or 0
                     out = usage.get("output_tokens", 0) or 0
                     cr  = usage.get("cache_read_input_tokens", 0) or 0
                     cc  = usage.get("cache_creation_input_tokens", 0) or 0
                     if inp + out + cr + cc == 0:
-                        continue
+                        continue   # message with no billed usage, no turn row
 
                     tool_name = None
                     for item in msg.get("content", []):
@@ -267,7 +317,7 @@ def parse_jsonl_file(filepath: str) -> Tuple[List[Dict[str, Any]], List[Dict[str
         log(f"  warning: error reading {filepath}: {e}")
 
     turns = turns_no_id + list(seen_messages.values())
-    return list(session_meta.values()), turns, line_count
+    return list(session_meta.values()), turns, records, line_count
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────────
@@ -286,50 +336,11 @@ def _http(method: str, url: str, headers: Dict[str, str], body: Optional[bytes] 
         return e.code, e.read()
 
 
-def api_get_upload_url(cfg: Dict[str, Any], os_username: str, machine_fp: str,
-                       content_hash: str) -> Dict[str, Any]:
-    body = json.dumps({
-        "os_username":  os_username,
-        "machine_fp":   machine_fp,
-        "content_hash": content_hash,
-    }).encode("utf-8")
-    status, raw = _http(
-        "POST",
-        cfg["server_url"].rstrip("/") + "/api/upload-url",
-        headers={
-            "Content-Type":   "application/json",
-            "X-Ingest-Token": cfg["ingest_token"],
-        },
-        body=body,
-    )
-    if status != 200:
-        raise CollectorError(f"/api/upload-url failed: HTTP {status} {raw[:200]!r}")
-    return json.loads(raw)
-
-
-def storage_put(upload_url: str, file_path: str, upload_token: Optional[str] = None) -> None:
-    """PUT a file to a Supabase Storage signed upload URL.
-
-    Supabase signed-upload URLs accept either:
-      • PUT with `Authorization: Bearer <token>` (when create_signed_upload_url
-        returned a token alongside the URL), OR
-      • PUT to the URL alone if the token is already in the query string.
-    We send both — extras are ignored.
-    """
-    with open(file_path, "rb") as f:
-        body = f.read()
-    headers = {"Content-Type": "application/octet-stream", "x-upsert": "true"}
-    if upload_token:
-        headers["Authorization"] = "Bearer " + upload_token
-    status, raw = _http("PUT", upload_url, headers=headers, body=body, timeout=120)
-    if status not in (200, 201):
-        raise CollectorError(f"Storage upload failed: HTTP {status} {raw[:300]!r}")
-
-
 def api_ingest(cfg: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     if len(body) > 4_400_000:
-        raise CollectorError(f"Ingest payload too large ({len(body)} bytes); reduce batch size")
+        raise CollectorError(
+            f"Ingest payload too large ({len(body)} bytes); reduce INGEST_BATCH_SIZE")
     status, raw = _http(
         "POST",
         cfg["server_url"].rstrip("/") + "/api/ingest",
@@ -342,16 +353,6 @@ def api_ingest(cfg: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
     if status != 200:
         raise CollectorError(f"/api/ingest failed: HTTP {status} {raw[:300]!r}")
     return json.loads(raw)
-
-
-# ── Hashing ─────────────────────────────────────────────────────────────────
-
-def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -370,10 +371,12 @@ def log(msg: str) -> None:
     global _LOG_FILE
     if _LOG_FILE is None:
         _LOG_FILE = _log_path()
-    line = f"[{datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}"
+    # datetime.utcnow() is deprecated in 3.12+; use timezone-aware now() and
+    # format manually to keep the same "...Z" suffix the user sees in logs.
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"[{ts}] {msg}"
     print(line, flush=True)
     try:
-        # Rough log rotation: if the file exceeds 5 MB, truncate the head.
         if _LOG_FILE.exists() and _LOG_FILE.stat().st_size > 5_000_000:
             with open(_LOG_FILE, "rb") as f:
                 f.seek(-2_000_000, os.SEEK_END)
@@ -389,10 +392,9 @@ def log(msg: str) -> None:
 # ── Main push loop ──────────────────────────────────────────────────────────
 
 def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
-    """Walk projects dirs, upload new content, post metadata, update state.
-
-    Idempotent: if the (path, mtime) matches local state, skip. We do NOT
-    rely on the server to dedupe; the server is the last line of defense.
+    """Walk projects dirs, parse new content, POST batches to /api/ingest,
+    update local state. Idempotent — already-processed line ranges are
+    skipped via the per-file `lines` counter in state.json.
     """
     state = load_state()
     machine_fp = state.get("machine_fp") or _make_machine_fp()
@@ -423,39 +425,31 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
         if rec and abs(rec.get("mtime", 0) - mtime) < 0.01:
             continue
         new_or_changed.append(fp)
-    log(f"{len(new_or_changed)} files need upload")
+    log(f"{len(new_or_changed)} files need processing")
 
     if dry_run:
-        return {"would_upload": len(new_or_changed)}
+        return {"would_process": len(new_or_changed)}
 
     sessions_acc: Dict[str, Dict[str, Any]] = {}
     turns_acc: List[Dict[str, Any]] = []
+    records_acc: List[Dict[str, Any]] = []
     file_records: List[Dict[str, Any]] = []
 
-    uploaded = 0
-    skipped = 0
+    parsed_files = 0
+    new_turn_count = 0
+    new_record_count = 0
 
     for fp in new_or_changed:
         try:
-            content_hash = sha256_file(fp)
+            prev = state["files"].get(fp) or {}
+            skip_lines = int(prev.get("lines") or 0)
 
-            # If we already uploaded this hash, skip the upload but still parse
-            # and submit turns (server dedupes on message_id).
-            rec = state["files"].get(fp)
-            need_upload = not rec or rec.get("content_hash") != content_hash
+            metas, turns, records, lines = parse_jsonl_file(fp, skip_lines=skip_lines)
+            parsed_files += 1
+            new_turn_count   += len(turns)
+            new_record_count += len(records)
 
-            if need_upload:
-                signed = api_get_upload_url(cfg, user["os_username"], machine_fp, content_hash)
-                storage_put(signed["upload_url"], fp, signed.get("upload_token"))
-                content_path = signed["object_path"]
-                uploaded += 1
-            else:
-                content_path = rec.get("content_path")
-                skipped += 1
-
-            metas, turns, lines = parse_jsonl_file(fp)
             for m in metas:
-                # Keep first/last timestamps wide across multiple files.
                 ex = sessions_acc.get(m["session_uuid"])
                 if not ex:
                     sessions_acc[m["session_uuid"]] = m
@@ -466,63 +460,74 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
                         ex["last_timestamp"] = m["last_timestamp"]
                     if _model_priority(m["model"]) > _model_priority(ex["model"]):
                         ex["model"] = m["model"]
-            for t in turns:
-                t["content_path"] = content_path
+
             turns_acc.extend(turns)
+            records_acc.extend(records)
             file_records.append({
-                "path":         fp,
-                "mtime":        os.path.getmtime(fp),
-                "lines":        lines,
-                "content_path": content_path,
+                "path":  fp,
+                "mtime": os.path.getmtime(fp),
+                "lines": lines,
             })
 
+            # Pre-stage state update; only commit to disk after successful
+            # ingest of the batches containing this file's data.
             state["files"][fp] = {
-                "mtime":        os.path.getmtime(fp),
-                "lines":        lines,
-                "content_hash": content_hash,
-                "content_path": content_path,
+                "mtime": os.path.getmtime(fp),
+                "lines": lines,
             }
         except Exception as e:
             log(f"  ERROR processing {fp}: {e}")
             log(traceback.format_exc())
-            # Don't fail the whole push for one bad file — continue.
             continue
 
-    log(f"uploads: {uploaded} new, {skipped} dedup-skipped (already in storage)")
+    log(f"parsed: {parsed_files} files, {new_turn_count} new turns, {new_record_count} new records")
 
-    # ── Post metadata in batches ──────────────────────────────────────────
-    if not turns_acc and not sessions_acc:
+    if not turns_acc and not records_acc and not sessions_acc:
         log("nothing to ingest")
         save_state(state)
-        return {"uploaded": uploaded, "skipped": skipped, "turns": 0, "sessions": 0}
+        return {"files": parsed_files, "turns": 0, "records": 0, "sessions": 0}
 
+    # ── POST in batches ───────────────────────────────────────────────────
     sessions_list = list(sessions_acc.values())
+    total_batches = max(
+        1,
+        (len(turns_acc)   + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
+        (len(records_acc) + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
+    )
     batches_sent = 0
 
-    # First batch carries all sessions + first chunk of turns; subsequent
-    # batches carry empty sessions list. Cheaper than re-sending sessions
-    # in every batch, and the server upserts safely either way.
-    for i in range(0, max(1, len(turns_acc)), INGEST_BATCH_SIZE):
-        chunk = turns_acc[i:i + INGEST_BATCH_SIZE]
+    for i in range(total_batches):
+        t_start = i * INGEST_BATCH_SIZE
+        r_start = i * INGEST_BATCH_SIZE
+        # Sessions + file-records go with the FIRST batch only — they're
+        # full upserts and don't need re-sending.
         payload = {
             "user":            user,
             "machine":         machine,
             "sessions":        sessions_list if i == 0 else [],
-            "turns":           chunk,
+            "turns":           turns_acc[t_start:t_start + INGEST_BATCH_SIZE],
+            "records":         records_acc[r_start:r_start + INGEST_BATCH_SIZE],
             "processed_files": file_records if i == 0 else [],
         }
         resp = api_ingest(cfg, payload)
         batches_sent += 1
-        log(f"  batch {batches_sent}: {len(chunk)} turns ingested -> {resp.get('turns_received')}")
+        log(
+            f"  batch {batches_sent}/{total_batches}: "
+            f"{len(payload['turns'])} turns, {len(payload['records'])} records → "
+            f"server got {resp.get('turns_received')}t / {resp.get('messages_received')}m"
+        )
 
     save_state(state)
-    log(f"push complete: {uploaded} files uploaded, {len(turns_acc)} turns across {len(sessions_list)} sessions, {batches_sent} batches")
+    log(
+        f"push complete: {parsed_files} files, {new_turn_count} turns across "
+        f"{len(sessions_list)} sessions, {batches_sent} batches"
+    )
     return {
-        "uploaded":   uploaded,
-        "skipped":    skipped,
-        "turns":      len(turns_acc),
-        "sessions":   len(sessions_list),
-        "batches":    batches_sent,
+        "files":    parsed_files,
+        "turns":    new_turn_count,
+        "records":  new_record_count,
+        "sessions": len(sessions_list),
+        "batches":  batches_sent,
     }
 
 
@@ -565,14 +570,14 @@ def main(argv=None):
     parser.add_argument("--config", help="Path to config.json (overrides search)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_push = sub.add_parser("push", help="Scan + upload new data to the server")
-    p_push.add_argument("--dry-run", action="store_true", help="List what would be uploaded; don't push")
+    p_push = sub.add_parser("push", help="Scan + push new data to the server")
+    p_push.add_argument("--dry-run", action="store_true", help="List what would be pushed; don't push")
     p_push.set_defaults(func=cmd_push)
 
     p_status = sub.add_parser("status", help="Print config + state summary")
     p_status.set_defaults(func=cmd_status)
 
-    p_reset = sub.add_parser("reset-state", help="Forget all upload history (next push re-uploads everything)")
+    p_reset = sub.add_parser("reset-state", help="Forget all push history (next push re-processes everything)")
     p_reset.set_defaults(func=cmd_reset)
 
     args = parser.parse_args(argv)
