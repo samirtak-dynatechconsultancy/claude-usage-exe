@@ -15,11 +15,24 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.0.0"
+#define MyAppVersion    "1.1.0"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define TaskName        "ClaudeCodeUsageCollector"
 #define TaskIntervalMin 15
+
+; ── Team-default config baked into the installer ─────────────────────────────
+; These pre-fill the wizard fields so end users don't have to type the
+; server URL / token. They are still overridable via /SERVERURL= and /TOKEN=
+; command-line flags (silent install path) or by editing the wizard fields
+; before clicking Next.
+;
+; ⚠ INGEST_TOKEN security note: anyone who downloads this installer can
+;    extract the embedded token (`strings ClaudeUsageCollector-Setup-*.exe`
+;    or unpack with InnoUnp). Use a long random token, not a guessable one,
+;    and treat it like a public-but-rate-limited shared secret.
+#define DefaultServerUrl    "https://claude-usage-dashboard-uhfn.vercel.app"
+#define DefaultIngestToken  "dynatechconsultancy"
 
 [Setup]
 AppId={{8A4E4A2C-3B57-4F2A-9C1A-3B7E1A2D0001}
@@ -132,9 +145,16 @@ begin
   ConfigPage.Add('Server URL (e.g. https://your-app.vercel.app):', False);
   ConfigPage.Add('Ingest token:', True);
 
-  { Pre-fill from /SERVERURL= and /TOKEN= command-line parameters if present. }
+  { Pre-fill priority:
+      1. /SERVERURL= or /TOKEN= command-line flags (silent install)
+      2. Team-default baked into the installer (#define above)
+    Both still editable by the user in the wizard before clicking Next. }
   ConfigPage.Values[0] := GetCmdLineParam('SERVERURL');
+  if ConfigPage.Values[0] = '' then
+    ConfigPage.Values[0] := '{#DefaultServerUrl}';
   ConfigPage.Values[1] := GetCmdLineParam('TOKEN');
+  if ConfigPage.Values[1] = '' then
+    ConfigPage.Values[1] := '{#DefaultIngestToken}';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
