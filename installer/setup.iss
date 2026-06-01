@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.3.0"
+#define MyAppVersion    "1.3.1"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define TaskName        "ClaudeCodeUsageCollector"
@@ -71,22 +71,16 @@ Name: "{group}\Uninstall"; Filename: "{uninstallexe}"
 Filename: "{app}\{#MyAppExeName}"; Parameters: "push"; WorkingDir: "{app}"; \
     Flags: runhidden nowait; StatusMsg: "Running first push..."
 
-; Register the recurring Scheduled Task (every {#TaskIntervalMin} minutes).
-; /RL HIGHEST so the task can read the user's Claude Code dir under their profile.
-; /F overwrites any prior task with the same name.
+; Register the recurring Scheduled Task via a single schtasks /Create /XML.
+; The XML (written in CurStepChanged before this fires) carries all settings:
+; trigger (every {#TaskIntervalMin}m), battery-friendly flags, run level.
+; This replaces the v1.2.1/v1.3.0 approach of schtasks-then-powershell-tweak,
+; which Sophos Endpoint Agent flagged as "Lockdown malicious behavior" —
+; powershell.exe from an installer modifying Scheduled Tasks looks like a
+; classic persistence pattern to AV heuristics.
 Filename: "schtasks.exe"; Parameters: \
-    "/Create /F /SC MINUTE /MO {#TaskIntervalMin} /TN ""{#TaskName}"" /TR ""\""{app}\{#MyAppExeName}\"" push"" /RL HIGHEST /RU ""{username}"""; \
+    "/Create /F /XML ""{tmp}\ClaudeCodeUsageCollector.xml"" /TN ""{#TaskName}"" /RU ""{username}"""; \
     Flags: runhidden; StatusMsg: "Registering Scheduled Task..."
-
-; schtasks defaults are battery-hostile: DisallowStartIfOnBatteries=true and
-; StopIfGoingOnBatteries=true mean a laptop on battery (most of the time!)
-; never runs the task, and an unplug mid-run kills the push. Also flip
-; StartWhenAvailable=true so a sleep-skipped run fires on wake instead of
-; piling up missed-run counters. schtasks.exe has no flags for any of this,
-; so we drive it via the PowerShell ScheduledTasks module.
-Filename: "powershell.exe"; Parameters: \
-    "-NoProfile -ExecutionPolicy Bypass -Command ""$t = Get-ScheduledTask -TaskName '{#TaskName}'; $t.Settings.StartWhenAvailable = $true; $t.Settings.DisallowStartIfOnBatteries = $false; $t.Settings.StopIfGoingOnBatteries = $false; Set-ScheduledTask -InputObject $t | Out-Null"""; \
-    Flags: runhidden; StatusMsg: "Tuning task for laptop / sleep use..."
 
 [UninstallRun]
 ; Remove the Scheduled Task. /F = no confirmation prompt.
@@ -196,6 +190,9 @@ var
   serverUrl:         String;
   ingestTok:         String;
   uploadContentStr:  String;
+  xmlPath:           String;
+  xml:               String;
+  exePath:           String;
 begin
   if CurStep <> ssPostInstall then Exit;
 
@@ -220,6 +217,65 @@ begin
     '  "projects_dirs":  null' + #13#10 +
     '}' + #13#10;
   SaveStringToFile(configPath, contents, False);
+
+  { Build the Scheduled Task XML used by the schtasks /Create /XML invocation
+    above. Embeds all the battery-friendly settings inline so we do not have
+    to call PowerShell post-create (which Sophos Endpoint Agent flags as
+    "Lockdown" malicious behavior). schtasks /XML accepts UTF-8 with BOM. }
+  exePath := ExpandConstant('{app}\{#MyAppExeName}');
+  xmlPath := ExpandConstant('{tmp}\ClaudeCodeUsageCollector.xml');
+  xml :=
+    '<?xml version="1.0" encoding="UTF-8"?>' + #13#10 +
+    '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + #13#10 +
+    '  <RegistrationInfo>' + #13#10 +
+    '    <Description>Claude Code Usage Collector - pushes new usage data every {#TaskIntervalMin} minutes</Description>' + #13#10 +
+    '  </RegistrationInfo>' + #13#10 +
+    '  <Triggers>' + #13#10 +
+    '    <TimeTrigger>' + #13#10 +
+    '      <Repetition>' + #13#10 +
+    '        <Interval>PT{#TaskIntervalMin}M</Interval>' + #13#10 +
+    '        <StopAtDurationEnd>false</StopAtDurationEnd>' + #13#10 +
+    '      </Repetition>' + #13#10 +
+    '      <StartBoundary>2026-01-01T00:00:00</StartBoundary>' + #13#10 +
+    '      <Enabled>true</Enabled>' + #13#10 +
+    '    </TimeTrigger>' + #13#10 +
+    '  </Triggers>' + #13#10 +
+    '  <Principals>' + #13#10 +
+    '    <Principal id="Author">' + #13#10 +
+    '      <LogonType>InteractiveToken</LogonType>' + #13#10 +
+    '      <RunLevel>HighestAvailable</RunLevel>' + #13#10 +
+    '    </Principal>' + #13#10 +
+    '  </Principals>' + #13#10 +
+    '  <Settings>' + #13#10 +
+    '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>' + #13#10 +
+    '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' + #13#10 +
+    '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + #13#10 +
+    '    <AllowHardTerminate>true</AllowHardTerminate>' + #13#10 +
+    '    <StartWhenAvailable>true</StartWhenAvailable>' + #13#10 +
+    '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>' + #13#10 +
+    '    <IdleSettings>' + #13#10 +
+    '      <StopOnIdleEnd>true</StopOnIdleEnd>' + #13#10 +
+    '      <RestartOnIdle>false</RestartOnIdle>' + #13#10 +
+    '    </IdleSettings>' + #13#10 +
+    '    <AllowStartOnDemand>true</AllowStartOnDemand>' + #13#10 +
+    '    <Enabled>true</Enabled>' + #13#10 +
+    '    <Hidden>false</Hidden>' + #13#10 +
+    '    <RunOnlyIfIdle>false</RunOnlyIfIdle>' + #13#10 +
+    '    <WakeToRun>false</WakeToRun>' + #13#10 +
+    '    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>' + #13#10 +
+    '    <Priority>7</Priority>' + #13#10 +
+    '  </Settings>' + #13#10 +
+    '  <Actions Context="Author">' + #13#10 +
+    '    <Exec>' + #13#10 +
+    '      <Command>' + exePath + '</Command>' + #13#10 +
+    '      <Arguments>push</Arguments>' + #13#10 +
+    '      <WorkingDirectory>' + ExpandConstant('{app}') + '</WorkingDirectory>' + #13#10 +
+    '    </Exec>' + #13#10 +
+    '  </Actions>' + #13#10 +
+    '</Task>' + #13#10;
+  { XML content above is pure ASCII, so byte-identical under ANSI / UTF-8 /
+    UTF-8-with-BOM-stripped. SaveStringToFile gives us all of those at once. }
+  SaveStringToFile(xmlPath, xml, False);
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
