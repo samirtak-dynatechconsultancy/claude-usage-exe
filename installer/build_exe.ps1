@@ -22,13 +22,20 @@ if (-not $pyiVersion) {
 
 # 2. Build.
 #  --onefile          one self-contained .exe
-#  --console          keep console so the Scheduled Task can capture stdout/stderr
+#  --windowed         GUI subsystem: no console window flash when the
+#                     Scheduled Task fires every 15 min. The collector
+#                     writes everything to its log file at
+#                     %LOCALAPPDATA%\ClaudeUsageCollector\collector.log,
+#                     so missing stdout is no real loss. Side effect:
+#                     running the exe interactively (e.g. ".\ClaudeUsageCollector.exe
+#                     status") prints nothing visibly -- redirect to a
+#                     file or read the log to see output.
 #  --noconfirm        skip "overwrite?" prompt
 #  --clean            wipe PyInstaller cache for repeatable builds
 #  --name             output filename (drops the .py)
 python -m PyInstaller `
     --onefile `
-    --console `
+    --windowed `
     --noconfirm `
     --clean `
     --name 'ClaudeUsageCollector' `
