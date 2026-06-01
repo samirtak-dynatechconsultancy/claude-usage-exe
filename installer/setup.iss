@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.2.0"
+#define MyAppVersion    "1.2.1"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define TaskName        "ClaudeCodeUsageCollector"
@@ -77,6 +77,16 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "push"; WorkingDir: "{app}"; \
 Filename: "schtasks.exe"; Parameters: \
     "/Create /F /SC MINUTE /MO {#TaskIntervalMin} /TN ""{#TaskName}"" /TR ""\""{app}\{#MyAppExeName}\"" push"" /RL HIGHEST /RU ""{username}"""; \
     Flags: runhidden; StatusMsg: "Registering Scheduled Task..."
+
+; schtasks defaults are battery-hostile: DisallowStartIfOnBatteries=true and
+; StopIfGoingOnBatteries=true mean a laptop on battery (most of the time!)
+; never runs the task, and an unplug mid-run kills the push. Also flip
+; StartWhenAvailable=true so a sleep-skipped run fires on wake instead of
+; piling up missed-run counters. schtasks.exe has no flags for any of this,
+; so we drive it via the PowerShell ScheduledTasks module.
+Filename: "powershell.exe"; Parameters: \
+    "-NoProfile -ExecutionPolicy Bypass -Command ""$t = Get-ScheduledTask -TaskName '{#TaskName}'; $t.Settings.StartWhenAvailable = $true; $t.Settings.DisallowStartIfOnBatteries = $false; $t.Settings.StopIfGoingOnBatteries = $false; Set-ScheduledTask -InputObject $t | Out-Null"""; \
+    Flags: runhidden; StatusMsg: "Tuning task for laptop / sleep use..."
 
 [UninstallRun]
 ; Remove the Scheduled Task. /F = no confirmation prompt.
