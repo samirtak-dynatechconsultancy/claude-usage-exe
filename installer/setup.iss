@@ -15,11 +15,13 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.3.2"
+#define MyAppVersion    "1.4.0"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
+#define MyTrayExeName   "ClaudeUsageTray.exe"
 #define TaskName        "ClaudeCodeUsageCollector"
 #define TaskIntervalMin 15
+#define TrayRunKey      "ClaudeUsageCollectorTray"
 
 ; ── Team-default config baked into the installer ─────────────────────────────
 ; These pre-fill the wizard fields so end users don't have to type the
@@ -57,13 +59,26 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "dist\ClaudeUsageCollector.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\ClaudeUsageTray.exe";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\collector\config.example.json"; DestDir: "{app}"; DestName: "config.example.json"; Flags: ignoreversion
 Source: "CONSENT.txt"; DestDir: "{app}"; Flags: ignoreversion
 
+[Registry]
+; Launch the tray at every login. HKCU so it's per-user. uninsdeletevalue
+; removes the entry cleanly on uninstall.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
+    ValueType: string; ValueName: "{#TrayRunKey}"; \
+    ValueData: """{app}\{#MyTrayExeName}"""; \
+    Flags: uninsdeletevalue
+
 [Icons]
-Name: "{group}\Push usage data now"; Filename: "{app}\{#MyAppExeName}"; Parameters: "push"; WorkingDir: "{app}"
+Name: "{group}\Open log";              Filename: "notepad.exe"; Parameters: """{localappdata}\ClaudeUsageCollector\collector.log"""
+Name: "{group}\Run push now";          Filename: "{app}\{#MyAppExeName}"; Parameters: "push"; WorkingDir: "{app}"
 Name: "{group}\Show collector status"; Filename: "{app}\{#MyAppExeName}"; Parameters: "status"; WorkingDir: "{app}"
-Name: "{group}\Uninstall"; Filename: "{uninstallexe}"
+Name: "{group}\Open install folder";   Filename: "{app}"
+Name: "{group}\Edit config";           Filename: "notepad.exe"; Parameters: """{app}\config.json"""
+Name: "{group}\Launch tray icon";      Filename: "{app}\{#MyTrayExeName}"
+Name: "{group}\Uninstall";             Filename: "{uninstallexe}"
 
 [Run]
 ; Run an initial push so the dashboard immediately sees this machine.
@@ -82,9 +97,22 @@ Filename: "schtasks.exe"; Parameters: \
     "/Create /F /XML ""{tmp}\ClaudeCodeUsageCollector.xml"" /TN ""{#TaskName}"" /RU ""{username}"""; \
     Flags: runhidden; StatusMsg: "Registering Scheduled Task..."
 
+; Launch the tray icon NOW so the user sees it immediately without having to
+; log out and back in. runasoriginaluser drops admin priv -- the tray runs
+; as the actual user, not the elevated installer.
+Filename: "{app}\{#MyTrayExeName}"; \
+    Flags: runasoriginaluser nowait skipifsilent; \
+    StatusMsg: "Starting tray icon..."
+
 [UninstallRun]
+; Kill the tray process so Inno Setup can delete its .exe without an
+; "in use" error. /F = force, /IM = match by image name.
+Filename: "taskkill.exe"; Parameters: "/F /IM ""{#MyTrayExeName}"""; \
+    Flags: runhidden; RunOnceId: "killTrayApp"
+
 ; Remove the Scheduled Task. /F = no confirmation prompt.
-Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""{#TaskName}"""; Flags: runhidden
+Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""{#TaskName}"""; \
+    Flags: runhidden; RunOnceId: "removeSchedTask"
 
 [UninstallDelete]
 ; The exe stops writing here at uninstall, but state.json / collector.log

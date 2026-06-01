@@ -1,2 +1,8 @@
-# collector.py is stdlib-only by design — fewer wheels for PyInstaller to bundle.
-# Add packages here only if you genuinely need them at runtime.
+# collector.py is stdlib-only by design - fewer wheels for PyInstaller to bundle.
+#
+# tray.py uses pystray + Pillow for the system tray icon (v1.4.0+). These
+# only need to be installed on the build machine, not on end-user machines
+# (PyInstaller bundles them into ClaudeUsageTray.exe).
+
+pystray>=0.19
+Pillow>=10.0
