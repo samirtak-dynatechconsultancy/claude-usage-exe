@@ -176,6 +176,7 @@ def _project_name_from_cwd(cwd: str) -> str:
 def parse_jsonl_file(
     filepath: str,
     skip_lines: int = 0,
+    collect_content: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], int]:
     """Parse a JSONL file. Returns (session_metas, turns, records, line_count).
 
@@ -186,6 +187,10 @@ def parse_jsonl_file(
     pushes don't re-send already-ingested content. If the file's current
     line count is *less* than skip_lines, the file was truncated/rewritten —
     re-parse everything.
+
+    When collect_content is False (privacy / metadata-only mode), `records`
+    is always returned empty. `turns` and session metadata still populate
+    so token charts and cost calculations work.
     """
     seen_messages: Dict[str, Dict[str, Any]] = {}
     turns_no_id: List[Dict[str, Any]] = []
@@ -259,18 +264,19 @@ def parse_jsonl_file(
                                 session_meta[session_id]["model"] = model
                     continue
 
-                # Always emit the record (for /api/ingest -> messages table).
-                # Strip down to the fields the server actually needs to keep
-                # the payload reasonable.
+                # Capture per-message content for the messages table — only if
+                # the user opted in. When off, we still emit the turn row below
+                # so charts/costs work; we just never send what was said.
                 msg = record.get("message", {}) or {}
                 msg_id = msg.get("id") if rtype == "assistant" else None
-                records.append({
-                    "session_uuid": session_id,
-                    "type":         rtype,
-                    "timestamp":    timestamp,
-                    "message_uuid": msg_id,
-                    "message":      msg,
-                })
+                if collect_content:
+                    records.append({
+                        "session_uuid": session_id,
+                        "type":         rtype,
+                        "timestamp":    timestamp,
+                        "message_uuid": msg_id,
+                        "message":      msg,
+                    })
 
                 if rtype == "assistant":
                     usage = msg.get("usage", {}) or {}
@@ -403,7 +409,16 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
     user = detect_user()
     machine = detect_machine(machine_fp)
 
-    log(f"push: user={user['os_username']} machine={machine['hostname']} fp={machine_fp[:8]}…")
+    # Privacy toggle (config.json: "upload_content": true | false).
+    # Default true preserves v1.2.x behavior on upgrade. When false, we send
+    # turn-level metadata (tokens, model, project, etc.) but NOT a single
+    # word of any prompt or response.
+    upload_content = bool(cfg.get("upload_content", True))
+
+    log(
+        f"push: user={user['os_username']} machine={machine['hostname']} "
+        f"fp={machine_fp[:8]}… content_uploads={'on' if upload_content else 'off'}"
+    )
 
     # ── Discover files ────────────────────────────────────────────────────
     projects_dirs = [Path(p) for p in cfg.get("projects_dirs") or []] or DEFAULT_PROJECTS_DIRS
@@ -444,7 +459,9 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
             prev = state["files"].get(fp) or {}
             skip_lines = int(prev.get("lines") or 0)
 
-            metas, turns, records, lines = parse_jsonl_file(fp, skip_lines=skip_lines)
+            metas, turns, records, lines = parse_jsonl_file(
+                fp, skip_lines=skip_lines, collect_content=upload_content,
+            )
             parsed_files += 1
             new_turn_count   += len(turns)
             new_record_count += len(records)

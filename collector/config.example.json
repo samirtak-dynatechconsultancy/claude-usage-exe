@@ -1,8 +1,14 @@
 {
-  "_comment": "Copy to config.json next to collector.exe (the installer does this for you) and fill in the two values below. Edit projects_dirs only if Claude Code stores transcripts in a non-default location.",
+  "_comment_1": "Copy to config.json next to ClaudeUsageCollector.exe (the installer does this for you) and fill in server_url + ingest_token.",
 
   "server_url":    "https://YOUR-VERCEL-APP.vercel.app",
   "ingest_token":  "REPLACE_WITH_INGEST_TOKEN_FROM_SERVER",
+
+  "_comment_2": "upload_content controls how much data the collector sends. true = full conversation text (lets the dashboard show what was discussed). false = metadata only (token counts, models, project names, timestamps -- no prompt or response text leaves this machine). Default is true. Edit and the next scheduled run picks the new value up.",
+
+  "upload_content": true,
+
+  "_comment_3": "projects_dirs overrides where to look for Claude Code JSONL files. null = defaults (~/.claude/projects and the Xcode coding-assistant dir).",
 
   "projects_dirs": null
 }

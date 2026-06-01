@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.2.1"
+#define MyAppVersion    "1.3.0"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define TaskName        "ClaudeCodeUsageCollector"
@@ -105,6 +105,7 @@ Type: files; Name: "{app}\config.json"
 var
   ConfigPage:  TInputQueryWizardPage;
   ConsentPage: TOutputMsgMemoWizardPage;
+  PrivacyPage: TInputOptionWizardPage;
 
 function GetCmdLineParam(const Name: String): String;
 var
@@ -146,8 +147,29 @@ begin
   );
   { Memo text is set after page creation. }
 
-  ConfigPage := CreateInputQueryPage(
+  { Privacy / data scope page: choose between full content and metadata only.
+    Sits between the consent screen and the server-connection page so the
+    user makes the choice before being asked for the team secret. }
+  PrivacyPage := CreateInputOptionPage(
     ConsentPage.ID,
+    'Data Scope',
+    'Choose how much data this machine sends',
+    'Token counts and project names are always sent (charts and costs need them). ' +
+    'Choose whether to also send the actual text of your conversations.',
+    True,   { Exclusive   = True  => radio buttons }
+    False   { ListBox     = False => standard radio look, not a listbox }
+  );
+  PrivacyPage.Add('Full conversation content (recommended for team audits, lets the dashboard show what was discussed)');
+  PrivacyPage.Add('Metadata only (token counts, models, project names — no prompt or response text leaves this machine)');
+
+  { Pre-fill from /CONTENT= silent-install flag if present; default to full. }
+  if LowerCase(Trim(GetCmdLineParam('CONTENT'))) = 'metadata' then
+    PrivacyPage.SelectedValueIndex := 1
+  else
+    PrivacyPage.SelectedValueIndex := 0;
+
+  ConfigPage := CreateInputQueryPage(
+    PrivacyPage.ID,
     'Server Connection',
     'Where should this machine send its data?',
     'Get these values from whoever set up the dashboard. The server URL is the Vercel deployment; the ingest token is a shared team secret.'
@@ -169,24 +191,33 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  configPath: String;
-  contents:   String;
-  serverUrl:  String;
-  ingestTok:  String;
+  configPath:        String;
+  contents:          String;
+  serverUrl:         String;
+  ingestTok:         String;
+  uploadContentStr:  String;
 begin
   if CurStep <> ssPostInstall then Exit;
 
   serverUrl := Trim(ConfigPage.Values[0]);
   ingestTok := Trim(ConfigPage.Values[1]);
 
+  { PrivacyPage.SelectedValueIndex: 0 = full content, 1 = metadata only.
+    Translate to a JSON boolean. }
+  if PrivacyPage.SelectedValueIndex = 1 then
+    uploadContentStr := 'false'
+  else
+    uploadContentStr := 'true';
+
   { Write config.json into the install dir. Use ASCII JSON so even non-ASCII
     hostnames don't trip the collector's json.loads on Python < 3.6. }
   configPath := ExpandConstant('{app}\config.json');
   contents :=
     '{' + #13#10 +
-    '  "server_url":    "'  + serverUrl + '",' + #13#10 +
-    '  "ingest_token":  "'  + ingestTok + '",' + #13#10 +
-    '  "projects_dirs": null' + #13#10 +
+    '  "server_url":     "' + serverUrl + '",' + #13#10 +
+    '  "ingest_token":   "' + ingestTok + '",' + #13#10 +
+    '  "upload_content": ' + uploadContentStr + ',' + #13#10 +
+    '  "projects_dirs":  null' + #13#10 +
     '}' + #13#10;
   SaveStringToFile(configPath, contents, False);
 end;
