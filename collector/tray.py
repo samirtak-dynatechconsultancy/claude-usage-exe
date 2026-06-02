@@ -17,10 +17,17 @@ Launched at login via an HKCU Run registry entry created by the installer.
 
 from __future__ import annotations
 
+import ctypes
+import json
 import os
 import subprocess
 import sys
+import threading
+import time
+import urllib.request
+import urllib.error
 from pathlib import Path
+from typing import Optional, Dict, Any
 
 import pystray
 from PIL import Image, ImageDraw, ImageFont
@@ -32,6 +39,19 @@ APP_NAME      = "ClaudeUsageCollector"
 DISPLAY_NAME  = "Claude Code Usage Collector"
 COLLECTOR_EXE = "ClaudeUsageCollector.exe"
 UNINSTALLER_GLOBS = ("unins000.exe", "unins001.exe", "unins002.exe")
+
+# ── Auto-update ────────────────────────────────────────────────────────────
+CURRENT_VERSION = "1.6.0"   # bumped on every release; ground truth for comparisons
+RELEASES_API_URL = (
+    "https://api.github.com/repos/samirtak-dynatechconsultancy/claude-usage-exe/releases/latest"
+)
+UPDATE_CHECK_INTERVAL_S = 24 * 3600    # 24 hours
+UPDATE_CHECK_DELAY_S    = 30           # first check fires 30s after tray start, not immediately
+
+# Module-global state. None = no update; dict = {version, download_url, notes_url}.
+_update_available: Optional[Dict[str, Any]] = None
+_update_thread:    Optional[threading.Thread] = None
+_icon_ref:         Optional[pystray.Icon] = None
 
 
 def install_dir() -> Path:
@@ -169,24 +189,187 @@ def on_quit(icon, item):
     icon.stop()
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
+# ── Auto-update helpers ────────────────────────────────────────────────────
 
-def main():
-    menu = pystray.Menu(
+def is_admin() -> bool:
+    """Whether the current process can write to Program Files (and thus run
+    the installer silently). On non-admin RDP sessions we surface the
+    update as "ask your admin" rather than triggering a doomed UAC prompt.
+    """
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _version_tuple(v: str) -> tuple:
+    """Parse 'v1.5.0' / '1.5.0' / '1.5.0-beta.1' into a 3-tuple of ints for
+    naive lexicographic comparison. Pre-release suffixes are ignored
+    (we don't ship pre-releases through this channel)."""
+    s = (v or "0").lstrip("vV").strip()
+    parts = []
+    for chunk in s.split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def _check_for_update_once() -> Optional[Dict[str, Any]]:
+    """Single GitHub poll. Returns update info if a strictly newer release
+    is found, otherwise None. Swallows all network errors silently — the
+    caller just retries on the next tick."""
+    try:
+        req = urllib.request.Request(
+            RELEASES_API_URL,
+            headers={
+                "User-Agent": f"{APP_NAME}-Tray/{CURRENT_VERSION}",
+                "Accept":     "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ConnectionError, OSError):
+        return None
+    except Exception:
+        return None
+
+    tag = (data.get("tag_name") or "").strip()
+    if not tag:
+        return None
+    if _version_tuple(tag) <= _version_tuple(CURRENT_VERSION):
+        return None
+
+    # Find the installer .exe in the release assets.
+    download_url = None
+    for asset in (data.get("assets") or []):
+        name = (asset.get("name") or "").lower()
+        if name.endswith(".exe") and "setup" in name:
+            download_url = asset.get("browser_download_url")
+            break
+    if not download_url:
+        return None
+
+    return {
+        "version":      tag.lstrip("vV"),
+        "tag":          tag,
+        "download_url": download_url,
+        "notes_url":    data.get("html_url"),
+    }
+
+
+def _update_check_loop():
+    """Background thread: poll, sleep, repeat. Sets module-level
+    `_update_available` and rebuilds the menu when state changes."""
+    global _update_available
+    # Wait briefly before the first check so tray startup isn't blocked
+    # if the network is slow.
+    time.sleep(UPDATE_CHECK_DELAY_S)
+    while True:
+        try:
+            info = _check_for_update_once()
+            prev = _update_available
+            if info != prev:
+                _update_available = info
+                # Re-render the menu by reassigning icon.menu (pystray refreshes
+                # the next time the user opens the right-click menu).
+                if _icon_ref is not None:
+                    try:
+                        _icon_ref.menu = _build_menu()
+                        _icon_ref.update_menu()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(UPDATE_CHECK_INTERVAL_S)
+
+
+def on_install_update(icon, item):
+    """Download the latest installer to %TEMP% and launch it."""
+    info = _update_available
+    if not info:
+        return
+
+    # Non-admins can see "update available" but can't actually install
+    # silently into Program Files. Open the release page in their browser
+    # so they at least have a clear next step (ask admin / save the file).
+    if not is_admin():
+        url = info.get("notes_url") or info.get("download_url")
+        try:
+            os.startfile(url)
+        except Exception:
+            pass
+        return
+
+    target = Path(os.environ.get("TEMP") or os.environ.get("LOCALAPPDATA") or str(Path.home())) \
+             / f"ClaudeUsageCollector-Setup-{info['version']}.exe"
+
+    try:
+        urllib.request.urlretrieve(info["download_url"], str(target))
+    except Exception:
+        return
+
+    # Launch the installer; UAC will fire because installer requires admin.
+    # /SP- suppresses the "ready to install" confirmation dialog so it's
+    # one prompt (UAC) for the user. The new installer will taskkill our
+    # tray + daemon during PrepareToInstall, so we exit cleanly first.
+    try:
+        subprocess.Popen([str(target), "/SP-"], close_fds=True)
+    except Exception:
+        return
+    icon.stop()
+
+
+def _build_menu() -> pystray.Menu:
+    """Build the right-click menu. Done as a function so we can rebuild it
+    when update state changes."""
+    items = [
         pystray.MenuItem("View log",            on_view_log,         default=True),
         pystray.MenuItem("Run push now",        on_push_now),
         pystray.MenuItem("Open install folder", on_open_install_dir),
         pystray.MenuItem("Edit config",         on_edit_config),
+    ]
+    if _update_available:
+        items.append(pystray.Menu.SEPARATOR)
+        admin_label = f"↻ Update to v{_update_available['version']}"
+        non_admin   = f"Update v{_update_available['version']} available — open release page"
+        items.append(pystray.MenuItem(
+            admin_label if is_admin() else non_admin,
+            on_install_update,
+        ))
+    items.extend([
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Uninstall",           on_uninstall),
         pystray.MenuItem("Exit tray icon",      on_quit),
-    )
+    ])
+    return pystray.Menu(*items)
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    global _icon_ref, _update_thread
     icon = pystray.Icon(
         APP_NAME,
         icon=make_icon_image(),
-        title=DISPLAY_NAME,
-        menu=menu,
+        title=f"{DISPLAY_NAME} v{CURRENT_VERSION}",
+        menu=_build_menu(),
     )
+    _icon_ref = icon
+
+    # Kick off the background update checker. daemon=True so it doesn't
+    # block process exit when the user picks "Exit tray icon".
+    _update_thread = threading.Thread(
+        target=_update_check_loop, daemon=True, name="update-checker",
+    )
+    _update_thread.start()
+
     icon.run()
 
 

@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.5.0"
+#define MyAppVersion    "1.6.0"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -141,6 +141,20 @@ var
   ConfigPage:  TInputQueryWizardPage;
   ConsentPage: TOutputMsgMemoWizardPage;
   PrivacyPage: TInputOptionWizardPage;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ErrorCode: Integer;
+begin
+  { v1.6+: in-place upgrades land here. The currently-running collector
+    daemon + tray hold their .exe handles open, which would cause Inno
+    Setup's file copy step to fail with "in use" prompts or restart-
+    required dialogs. taskkill them first; /F means SIGKILL-equivalent,
+    and the new install's [Run] section restarts both. }
+  Exec('taskkill.exe', '/F /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  Exec('taskkill.exe', '/F /IM "{#MyTrayExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  Result := '';
+end;
 
 function GetCmdLineParam(const Name: String): String;
 var
