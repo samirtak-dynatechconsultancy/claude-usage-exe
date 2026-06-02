@@ -40,8 +40,15 @@ DISPLAY_NAME  = "Claude Code Usage Collector"
 COLLECTOR_EXE = "ClaudeUsageCollector.exe"
 UNINSTALLER_GLOBS = ("unins000.exe", "unins001.exe", "unins002.exe")
 
+# ── Self-identify (RDP client → real user mapping) ─────────────────────────
+IDENTIFY_CHECK_DELAY_S    = 60          # don't pop up during login storm
+IDENTIFY_SKIP_TTL_S       = 24 * 3600   # how long "Skip" mutes the popup
+IDENTIFY_SKIP_FLAG_FILE   = "identify-skip-until.txt"
+_identify_state = {"checked": False, "mapped": None, "client_machine": None}
+_identify_lock  = None   # threading.Lock instance, created in main()
+
 # ── Auto-update ────────────────────────────────────────────────────────────
-CURRENT_VERSION = "1.6.1"   # bumped on every release; ground truth for comparisons
+CURRENT_VERSION = "1.7.0"   # bumped on every release; ground truth for comparisons
 RELEASES_API_URL = (
     "https://api.github.com/repos/samirtak-dynatechconsultancy/claude-usage-exe/releases/latest"
 )
@@ -81,6 +88,46 @@ def uninstaller_path() -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def _local_state_dir() -> Path:
+    """Per-CLIENTNAME local state, mirrors collector.py's _state_path layout."""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    root = Path(base) / APP_NAME
+    clientname = (os.environ.get("CLIENTNAME") or "").strip()
+    if clientname and clientname.lower() != "console":
+        # Slug for the dir name; mirrors collector's _safe_dirname
+        slug = "".join(
+            ch if ch.isalnum() or ch in ("-", "_", ".") else "_"
+            for ch in clientname[:64]
+        ) or "default"
+        out = root / "clients" / slug
+    else:
+        out = root
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _load_collector_config() -> Optional[Dict[str, Any]]:
+    """Read the same config.json the collector uses (next to the exe)."""
+    cfg_path = install_dir() / "config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _current_client_machine() -> Optional[str]:
+    """The CLIENTNAME the collector identifies by. None on physical
+    (non-RDP) installs where we use getpass.getuser instead -- those
+    users don't need the identify popup."""
+    cn = (os.environ.get("CLIENTNAME") or "").strip()
+    if not cn or cn.lower() == "console":
+        return None
+    return cn
 
 
 # ── Icon ────────────────────────────────────────────────────────────────────
@@ -326,15 +373,264 @@ def on_install_update(icon, item):
     icon.stop()
 
 
+def _skip_flag_until() -> Optional[float]:
+    """Read the snooze timestamp set when user clicks Skip in the popup.
+    Returns the unix epoch seconds until which we should stay quiet."""
+    f = _local_state_dir() / IDENTIFY_SKIP_FLAG_FILE
+    if not f.is_file():
+        return None
+    try:
+        return float(f.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def _write_skip_until(ts: float) -> None:
+    try:
+        f = _local_state_dir() / IDENTIFY_SKIP_FLAG_FILE
+        f.write_text(str(ts), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _ingest_url(path: str) -> Optional[str]:
+    cfg = _load_collector_config()
+    if not cfg or not cfg.get("server_url"):
+        return None
+    return cfg["server_url"].rstrip("/") + path
+
+
+def _ingest_headers() -> Optional[Dict[str, str]]:
+    cfg = _load_collector_config()
+    if not cfg or not cfg.get("ingest_token"):
+        return None
+    return {
+        "X-Ingest-Token": cfg["ingest_token"],
+        "Content-Type":   "application/json",
+        "User-Agent":     f"{APP_NAME}-Tray/{CURRENT_VERSION}",
+    }
+
+
+def _check_identify_status() -> Optional[bool]:
+    """Returns True if mapped, False if not, None if we couldn't tell
+    (no network, missing config, etc.) -- in which case we just stay
+    quiet and try again next launch."""
+    client_machine = _current_client_machine()
+    if not client_machine:
+        return True   # non-RDP machine -- nothing to identify
+    url     = _ingest_url(f"/api/identify?client_machine={client_machine}")
+    headers = _ingest_headers()
+    if not url or not headers:
+        return None
+    try:
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+            return bool(data.get("mapped"))
+    except Exception:
+        return None
+
+
+def _submit_identity(os_username: str, display_name: str, email: str) -> tuple[bool, str]:
+    """POST to /api/identify. Returns (ok, message)."""
+    client_machine = _current_client_machine()
+    if not client_machine:
+        return (False, "This isn't an RDP session — no CLIENTNAME to map.")
+    url     = _ingest_url("/api/identify")
+    headers = _ingest_headers()
+    if not url or not headers:
+        return (False, "Server URL or ingest token missing from config.json.")
+    body = json.dumps({
+        "client_machine": client_machine,
+        "os_username":    os_username,
+        "display_name":   display_name or None,
+        "email":          email or None,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return (True, "Identity confirmed.")
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read())
+            return (False, err.get("error") or f"HTTP {e.code}")
+        except Exception:
+            return (False, f"HTTP {e.code}")
+    except Exception as e:
+        return (False, f"Network error: {e}")
+
+
+def show_identify_dialog(forced_open=False) -> None:
+    """Open a tkinter modal asking the user for their first_name.last_name.
+
+    Called either from the identity-check background thread (when unmapped)
+    or directly from the tray's "Identify this machine" menu item.
+    """
+    import re
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    client_machine = _current_client_machine()
+    if not client_machine:
+        return
+
+    # Snooze check (only honor when the popup is auto-triggered, not when
+    # the user explicitly clicked the menu item)
+    if not forced_open:
+        skip_until = _skip_flag_until()
+        if skip_until and time.time() < skip_until:
+            return
+
+    root = tk.Tk()
+    root.title(f"{DISPLAY_NAME} — Identify your machine")
+    root.geometry("460x340")
+    root.resizable(False, False)
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    pad = 14
+    frm = tk.Frame(root, padx=pad, pady=pad)
+    frm.pack(fill="both", expand=True)
+
+    tk.Label(frm, text="Welcome — please identify yourself",
+             font=("Segoe UI", 12, "bold"), fg="#d97757").pack(anchor="w")
+    tk.Label(frm,
+             text=f"This machine: {client_machine}\n\n"
+                  f"To attribute your Claude Code usage correctly, "
+                  f"enter your name below in first_name.last_name format.",
+             justify="left", wraplength=420).pack(anchor="w", pady=(8, 12))
+
+    # Inputs
+    grid = tk.Frame(frm)
+    grid.pack(fill="x")
+    grid.grid_columnconfigure(1, weight=1)
+
+    tk.Label(grid, text="Username *", anchor="e").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=4)
+    username_var = tk.StringVar()
+    user_entry = tk.Entry(grid, textvariable=username_var)
+    user_entry.grid(row=0, column=1, sticky="ew", pady=4)
+    user_entry.focus()
+
+    tk.Label(grid, text="(e.g. samir.tak)", fg="#888",
+             font=("Segoe UI", 8)).grid(row=1, column=1, sticky="w")
+
+    tk.Label(grid, text="Display name", anchor="e").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=(8, 4))
+    display_var = tk.StringVar()
+    tk.Entry(grid, textvariable=display_var).grid(row=2, column=1, sticky="ew", pady=(8, 4))
+    tk.Label(grid, text="optional (e.g. Samir Tak)", fg="#888",
+             font=("Segoe UI", 8)).grid(row=3, column=1, sticky="w")
+
+    tk.Label(grid, text="Email", anchor="e").grid(row=4, column=0, sticky="e", padx=(0, 8), pady=(8, 4))
+    email_var = tk.StringVar()
+    tk.Entry(grid, textvariable=email_var).grid(row=4, column=1, sticky="ew", pady=(8, 4))
+    tk.Label(grid, text="optional", fg="#888",
+             font=("Segoe UI", 8)).grid(row=5, column=1, sticky="w")
+
+    # Buttons
+    btns = tk.Frame(frm)
+    btns.pack(fill="x", pady=(16, 0))
+
+    def on_confirm():
+        username = username_var.get().strip().lower()
+        if not re.match(r"^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)+$", username):
+            messagebox.showerror("Invalid format",
+                "Username must be in first_name.last_name format\n"
+                "(lowercase letters, digits, hyphens, underscores; "
+                "at least one period).",
+                parent=root)
+            return
+        confirm_btn.config(state="disabled", text="Submitting…")
+        root.update_idletasks()
+        ok, message = _submit_identity(username, display_var.get().strip(), email_var.get().strip())
+        if ok:
+            messagebox.showinfo("Thanks!",
+                f"This machine is now mapped to {username}. "
+                f"Your past and future Claude Code activity will be attributed to you.",
+                parent=root)
+            _identify_state["mapped"] = True
+            if _icon_ref is not None:
+                try:
+                    _icon_ref.menu = _build_menu()
+                    _icon_ref.update_menu()
+                except Exception:
+                    pass
+            root.destroy()
+        else:
+            messagebox.showerror("Couldn't save", message, parent=root)
+            confirm_btn.config(state="normal", text="Confirm")
+
+    def on_skip():
+        _write_skip_until(time.time() + IDENTIFY_SKIP_TTL_S)
+        root.destroy()
+
+    tk.Button(btns, text="Skip for now", command=on_skip, width=14).pack(side="left")
+    confirm_btn = tk.Button(btns, text="Confirm",   command=on_confirm,
+                             width=14, bg="#d97757", fg="white",
+                             activebackground="#c66647", activeforeground="white")
+    confirm_btn.pack(side="right")
+
+    # Keyboard shortcuts
+    root.bind("<Return>", lambda e: on_confirm())
+    root.bind("<Escape>", lambda e: on_skip())
+
+    root.mainloop()
+
+
+def _identify_check_loop():
+    """Background thread: after IDENTIFY_CHECK_DELAY_S, query the server
+    once. If unmapped (and not snoozed), surface the dialog. The menu
+    item appears whether or not the popup was shown, so the user can
+    always re-open it later."""
+    time.sleep(IDENTIFY_CHECK_DELAY_S)
+    client_machine = _current_client_machine()
+    if not client_machine:
+        _identify_state["mapped"] = True   # treat non-RDP as "no need"
+        return
+    _identify_state["client_machine"] = client_machine
+
+    mapped = _check_identify_status()
+    if mapped is None:
+        return    # silent retry next launch
+    _identify_state["checked"] = True
+    _identify_state["mapped"]  = mapped
+
+    if not mapped:
+        # Rebuild menu so the "Identify this machine" item shows up
+        if _icon_ref is not None:
+            try:
+                _icon_ref.menu = _build_menu()
+                _icon_ref.update_menu()
+            except Exception:
+                pass
+        # Auto-open the dialog if user hasn't snoozed it
+        show_identify_dialog(forced_open=False)
+
+
+def on_identify_click(icon, item):
+    """User clicked the 'Identify this machine' menu item -- open the
+    dialog even if they previously snoozed."""
+    show_identify_dialog(forced_open=True)
+
+
 def _build_menu() -> pystray.Menu:
     """Build the right-click menu. Done as a function so we can rebuild it
-    when update state changes."""
+    when update or identify state changes."""
     items = [
         pystray.MenuItem("View log",            on_view_log,         default=True),
         pystray.MenuItem("Run push now",        on_push_now),
         pystray.MenuItem("Open install folder", on_open_install_dir),
         pystray.MenuItem("Edit config",         on_edit_config),
     ]
+    # "Identify this machine" — only shown on RDP machines that we know
+    # are unmapped. Always re-openable via click even if user previously
+    # snoozed the auto popup.
+    if _identify_state.get("checked") and _identify_state.get("mapped") is False:
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem(
+            "⚠ Identify this machine", on_identify_click,
+        ))
     if _update_available:
         items.append(pystray.Menu.SEPARATOR)
         admin_label = f"↻ Update to v{_update_available['version']}"
@@ -369,6 +665,13 @@ def main():
         target=_update_check_loop, daemon=True, name="update-checker",
     )
     _update_thread.start()
+
+    # Self-identify check: 60s after launch, asks the server if this
+    # CLIENTNAME is already mapped to a user. If not (and snooze not
+    # active), opens a tkinter popup asking the user to confirm.
+    threading.Thread(
+        target=_identify_check_loop, daemon=True, name="identify-checker",
+    ).start()
 
     icon.run()
 
