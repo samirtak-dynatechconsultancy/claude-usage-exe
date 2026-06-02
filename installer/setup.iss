@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.6.0"
+#define MyAppVersion    "1.6.1"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -62,7 +62,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "dist\ClaudeUsageCollector.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\ClaudeUsageTray.exe";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\collector\config.example.json"; DestDir: "{app}"; DestName: "config.example.json"; Flags: ignoreversion
-Source: "CONSENT.txt"; DestDir: "{app}"; Flags: ignoreversion
+; CONSENT.txt is the last file -- its AfterInstall procedure writes
+; config.json. That guarantees config.json exists before [Run] fires the
+; daemon. v1.6.0 wrote config.json in CurStepChanged(ssPostInstall) which
+; runs AFTER [Run], so the daemon's first launch crashed with
+; FileNotFoundError on a fresh install.
+Source: "CONSENT.txt"; DestDir: "{app}"; Flags: ignoreversion; AfterInstall: WriteConfigJson
 
 [Registry]
 ; Launch the collector daemon at every login -- for EVERY user on this box.
@@ -238,7 +243,7 @@ begin
     ConfigPage.Values[1] := '{#DefaultIngestToken}';
 end;
 
-procedure CurStepChanged(CurStep: TSetupStep);
+procedure WriteConfigJson;
 var
   configPath:        String;
   contents:          String;
@@ -246,7 +251,14 @@ var
   ingestTok:         String;
   uploadContentStr:  String;
 begin
-  if CurStep <> ssPostInstall then Exit;
+  { Called from the Files AfterInstall hook on CONSENT.txt (the last file).
+    Runs AFTER all Files entries are copied but BEFORE the Run section
+    fires the daemon -- which is exactly the slot we need so the daemon
+    finds a populated config on its first launch.
+
+    v1.6.0 did this in CurStepChanged(ssPostInstall) which fires AFTER
+    the Run section, so the daemon's first launch crashed with
+    FileNotFoundError on a fresh install. }
 
   serverUrl := Trim(ConfigPage.Values[0]);
   ingestTok := Trim(ConfigPage.Values[1]);
@@ -269,11 +281,6 @@ begin
     '  "projects_dirs":  null' + #13#10 +
     '}' + #13#10;
   SaveStringToFile(configPath, contents, False);
-
-  { v1.5 dropped the Scheduled Task XML generation -- autostart is via the
-    HKLM Run registry entry written by the [Registry] section. Each logged-in
-    user inherits that entry on logon and spawns their own daemon process
-    under their identity. }
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;

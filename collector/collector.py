@@ -632,11 +632,41 @@ def cmd_daemon(args):
     every login. The process lives until the user logs off. On an RDP host
     with N concurrent users, each user has their own daemon in their own
     session, each pushing as their own CLIENTNAME identity.
+
+    Config loading is retried indefinitely with a 10-second backoff. This
+    is defense-in-depth against the install-time race that bit v1.6.0,
+    where the daemon was launched before config.json had been written by
+    the installer. v1.6.1's installer writes config.json before [Run]
+    fires, but this retry keeps things working if a future install ever
+    hits the same ordering issue, or if config.json is briefly missing
+    for any other reason (Sophos quarantine + release, admin editing it
+    by hand, etc.).
     """
-    cfg, path = load_config(args.config)
-    log(f"daemon starting (config: {path}, interval: {args.interval}s)")
+    log(f"daemon starting (interval: {args.interval}s)")
+
+    cfg = None
+    config_path = None
+    waited = 0
+    while cfg is None:
+        try:
+            cfg, config_path = load_config(args.config)
+        except FileNotFoundError as e:
+            if waited == 0:
+                log(f"daemon: config.json not found yet, will retry every 10s")
+                log(str(e))
+            else:
+                log(f"daemon: still waiting for config.json ({waited}s elapsed)")
+            try:
+                time.sleep(10)
+                waited += 10
+            except KeyboardInterrupt:
+                log("daemon interrupted while waiting for config, exiting")
+                return
+
+    log(f"daemon: config loaded from {config_path}")
     user = detect_user()
     log(f"daemon identity: os_username={user['os_username']} source={user.get('identity_source')}")
+
     while True:
         try:
             push(cfg)

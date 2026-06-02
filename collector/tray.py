@@ -41,7 +41,7 @@ COLLECTOR_EXE = "ClaudeUsageCollector.exe"
 UNINSTALLER_GLOBS = ("unins000.exe", "unins001.exe", "unins002.exe")
 
 # ── Auto-update ────────────────────────────────────────────────────────────
-CURRENT_VERSION = "1.6.0"   # bumped on every release; ground truth for comparisons
+CURRENT_VERSION = "1.6.1"   # bumped on every release; ground truth for comparisons
 RELEASES_API_URL = (
     "https://api.github.com/repos/samirtak-dynatechconsultancy/claude-usage-exe/releases/latest"
 )
