@@ -31,6 +31,7 @@ import json
 import os
 import socket
 import sys
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -43,7 +44,8 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.2"
+USER_AGENT = "claude-usage-collector/1.5"
+DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 DEFAULT_PROJECTS_DIRS = [
     Path.home() / ".claude" / "projects",
     Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects",
@@ -100,9 +102,35 @@ def load_config(override: Optional[str] = None) -> Tuple[Dict[str, Any], Path]:
 # new tail next time, no duplicate user/assistant message rows on the
 # server side). content_hash from v1.x is retained for safety but unused.
 
+def _safe_dirname(s: str) -> str:
+    """Slugify a string for use as a Windows directory name."""
+    if not s:
+        return "default"
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            out.append(ch)
+        else:
+            out.append("_")
+    return ("".join(out) or "default")[:64]
+
+
 def _state_path() -> Path:
+    """Per-CLIENTNAME state file.
+
+    On a shared-OS-user RDP host, multiple RDP sessions land in the same
+    %LOCALAPPDATA% (they share an OS user). Without scoping by CLIENTNAME
+    they'd trample each other's state.json. Each client device gets its
+    own subdir so co-located sessions don't interfere.
+    """
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
-    p = Path(base) / APP_NAME / "state.json"
+    root = Path(base) / APP_NAME
+
+    clientname = (os.environ.get("CLIENTNAME") or "").strip()
+    if clientname and clientname.lower() != "console":
+        p = root / "clients" / _safe_dirname(clientname) / "state.json"
+    else:
+        p = root / "state.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -137,16 +165,56 @@ def _make_machine_fp() -> str:
 # ── Identification ──────────────────────────────────────────────────────────
 
 def detect_user() -> Dict[str, str]:
+    """Resolve the user identifier for this collector instance.
+
+    Priority order:
+      1. CLAUDE_USAGE_USER env var (explicit override)
+      2. %CLIENTNAME% (RDP source device -- on a shared-OS-user RDP host
+         this is the only signal that distinguishes Alice from Bob)
+      3. getpass.getuser() (physical laptop / non-RDP login)
+    """
     import getpass
-    return {"os_username": (getpass.getuser() or "unknown").strip()}
 
+    explicit = (os.environ.get("CLAUDE_USAGE_USER") or "").strip()
+    if explicit:
+        return {"os_username": explicit, "identity_source": "explicit"}
 
-def detect_machine(machine_fp: str) -> Dict[str, str]:
+    clientname = (os.environ.get("CLIENTNAME") or "").strip()
+    if clientname and clientname.lower() != "console":
+        return {"os_username": clientname, "identity_source": "clientname"}
+
     return {
+        "os_username":     (getpass.getuser() or "unknown").strip(),
+        "identity_source": "getuser",
+    }
+
+
+def detect_machine(machine_fp: str) -> Dict[str, Any]:
+    """Capture hostname + RDP session info if applicable.
+
+    is_rdp is true when either:
+      - SESSIONNAME starts with 'RDP-' (Windows tags RDP session names this way), or
+      - CLIENTNAME is set to anything other than 'Console'.
+    """
+    clientname  = (os.environ.get("CLIENTNAME")  or "").strip()
+    sessionname = (os.environ.get("SESSIONNAME") or "").strip()
+    is_rdp = sessionname.startswith("RDP-") or (
+        bool(clientname) and clientname.lower() != "console"
+    )
+
+    payload: Dict[str, Any] = {
         "hostname":   socket.gethostname(),
         "os":         f"{sys.platform} {os.environ.get('OS', '')}".strip(),
         "machine_fp": machine_fp,
+        "is_rdp":     is_rdp,
     }
+    if is_rdp:
+        if clientname:
+            payload["client_machine"] = clientname
+        if sessionname:
+            payload["session_id"]     = sessionname
+            payload["rdp_session_id"] = sessionname
+    return payload
 
 
 # ── JSONL parsing ───────────────────────────────────────────────────────────
@@ -556,6 +624,35 @@ def cmd_push(args):
     push(cfg, dry_run=args.dry_run)
 
 
+def cmd_daemon(args):
+    """Run forever, pushing every N seconds.
+
+    This is the default mode for v1.5+ installs -- the installer registers
+    an HKLM Run entry that starts 'ClaudeUsageCollector.exe daemon' on
+    every login. The process lives until the user logs off. On an RDP host
+    with N concurrent users, each user has their own daemon in their own
+    session, each pushing as their own CLIENTNAME identity.
+    """
+    cfg, path = load_config(args.config)
+    log(f"daemon starting (config: {path}, interval: {args.interval}s)")
+    user = detect_user()
+    log(f"daemon identity: os_username={user['os_username']} source={user.get('identity_source')}")
+    while True:
+        try:
+            push(cfg)
+        except KeyboardInterrupt:
+            log("daemon interrupted, exiting")
+            return
+        except Exception as e:
+            log(f"daemon push iteration failed: {e}")
+            log(traceback.format_exc())
+        try:
+            time.sleep(args.interval)
+        except KeyboardInterrupt:
+            log("daemon interrupted during sleep, exiting")
+            return
+
+
 def cmd_status(args):
     try:
         cfg, path = load_config(args.config)
@@ -587,9 +684,14 @@ def main(argv=None):
     parser.add_argument("--config", help="Path to config.json (overrides search)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_push = sub.add_parser("push", help="Scan + push new data to the server")
+    p_push = sub.add_parser("push", help="Scan + push new data to the server (one-shot)")
     p_push.add_argument("--dry-run", action="store_true", help="List what would be pushed; don't push")
     p_push.set_defaults(func=cmd_push)
+
+    p_daemon = sub.add_parser("daemon", help="Run forever; push every --interval seconds (default 900)")
+    p_daemon.add_argument("--interval", type=int, default=DAEMON_SLEEP_SECONDS,
+                          help="seconds between pushes (default: 900)")
+    p_daemon.set_defaults(func=cmd_daemon)
 
     p_status = sub.add_parser("status", help="Print config + state summary")
     p_status.set_defaults(func=cmd_status)

@@ -15,13 +15,14 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.4.0"
+#define MyAppVersion    "1.5.0"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
 #define TaskName        "ClaudeCodeUsageCollector"
 #define TaskIntervalMin 15
 #define TrayRunKey      "ClaudeUsageCollectorTray"
+#define CollectorRunKey "ClaudeUsageCollectorDaemon"
 
 ; ── Team-default config baked into the installer ─────────────────────────────
 ; These pre-fill the wizard fields so end users don't have to type the
@@ -64,8 +65,19 @@ Source: "..\collector\config.example.json"; DestDir: "{app}"; DestName: "config.
 Source: "CONSENT.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
-; Launch the tray at every login. HKCU so it's per-user. uninsdeletevalue
-; removes the entry cleanly on uninstall.
+; Launch the collector daemon at every login -- for EVERY user on this box.
+; HKLM (not HKCU) is the key change from the v1.4 Scheduled Task model:
+; each Windows session (RDP or local) inherits this entry on logon and
+; spawns its own daemon process under that user's identity. The daemon
+; reads %CLIENTNAME% to attribute pushes to the right human even on a
+; shared OS user (typical RDP).
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
+    ValueType: string; ValueName: "{#CollectorRunKey}"; \
+    ValueData: """{app}\{#MyAppExeName}"" daemon"; \
+    Flags: uninsdeletevalue
+
+; Launch the tray at every login (per-user HKCU since it's a UI thing).
+; uninsdeletevalue removes the entry cleanly on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueType: string; ValueName: "{#TrayRunKey}"; \
     ValueData: """{app}\{#MyTrayExeName}"""; \
@@ -81,21 +93,19 @@ Name: "{group}\Launch tray icon";      Filename: "{app}\{#MyTrayExeName}"
 Name: "{group}\Uninstall";             Filename: "{uninstallexe}"
 
 [Run]
-; Run an initial push so the dashboard immediately sees this machine.
-; Hidden — we don't want a console flashing in front of the user.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "push"; WorkingDir: "{app}"; \
-    Flags: runhidden nowait; StatusMsg: "Running first push..."
+; v1.5 model: no Scheduled Task. The HKLM Run entry above autostarts the
+; collector daemon on every user logon. To cover the upgrade-in-place case
+; (someone running v1.4 with an existing Scheduled Task), delete it now.
+; /F means "no confirmation", so it silently no-ops if the task isn't there.
+Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""{#TaskName}"""; \
+    Flags: runhidden skipifsilent; StatusMsg: "Removing legacy Scheduled Task (if any)..."
 
-; Register the recurring Scheduled Task via a single schtasks /Create /XML.
-; The XML (written in CurStepChanged before this fires) carries all settings:
-; trigger (every {#TaskIntervalMin}m), battery-friendly flags, run level.
-; This replaces the v1.2.1/v1.3.0 approach of schtasks-then-powershell-tweak,
-; which Sophos Endpoint Agent flagged as "Lockdown malicious behavior" —
-; powershell.exe from an installer modifying Scheduled Tasks looks like a
-; classic persistence pattern to AV heuristics.
-Filename: "schtasks.exe"; Parameters: \
-    "/Create /F /XML ""{tmp}\ClaudeCodeUsageCollector.xml"" /TN ""{#TaskName}"" /RU ""{username}"""; \
-    Flags: runhidden; StatusMsg: "Registering Scheduled Task..."
+; Start the daemon NOW for the install user so they don't have to log out
+; and back in to see data flowing. runasoriginaluser drops admin priv.
+; nowait so the install finishes; the daemon runs forever.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "daemon"; WorkingDir: "{app}"; \
+    Flags: runasoriginaluser nowait; \
+    StatusMsg: "Starting collector daemon..."
 
 ; Launch the tray icon NOW so the user sees it immediately without having to
 ; log out and back in. runasoriginaluser drops admin priv -- the tray runs
@@ -105,14 +115,17 @@ Filename: "{app}\{#MyTrayExeName}"; \
     StatusMsg: "Starting tray icon..."
 
 [UninstallRun]
-; Kill the tray process so Inno Setup can delete its .exe without an
-; "in use" error. /F = force, /IM = match by image name.
+; Kill the running daemon + tray processes so Inno Setup can delete their
+; .exes without "in use" errors. /F = force, /IM = match by image name.
+Filename: "taskkill.exe"; Parameters: "/F /IM ""{#MyAppExeName}"""; \
+    Flags: runhidden; RunOnceId: "killCollectorDaemon"
 Filename: "taskkill.exe"; Parameters: "/F /IM ""{#MyTrayExeName}"""; \
     Flags: runhidden; RunOnceId: "killTrayApp"
 
-; Remove the Scheduled Task. /F = no confirmation prompt.
+; Belt-and-suspenders: kill any legacy Scheduled Task left over from v1.4
+; installs. /F = no confirmation. Silently no-ops if absent.
 Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""{#TaskName}"""; \
-    Flags: runhidden; RunOnceId: "removeSchedTask"
+    Flags: runhidden; RunOnceId: "removeLegacySchedTask"
 
 [UninstallDelete]
 ; The exe stops writing here at uninstall, but state.json / collector.log
@@ -218,9 +231,6 @@ var
   serverUrl:         String;
   ingestTok:         String;
   uploadContentStr:  String;
-  xmlPath:           String;
-  xml:               String;
-  exePath:           String;
 begin
   if CurStep <> ssPostInstall then Exit;
 
@@ -246,64 +256,10 @@ begin
     '}' + #13#10;
   SaveStringToFile(configPath, contents, False);
 
-  { Build the Scheduled Task XML used by the schtasks /Create /XML invocation
-    above. Embeds all the battery-friendly settings inline so we do not have
-    to call PowerShell post-create (which Sophos Endpoint Agent flags as
-    "Lockdown" malicious behavior). schtasks /XML accepts UTF-8 with BOM. }
-  exePath := ExpandConstant('{app}\{#MyAppExeName}');
-  xmlPath := ExpandConstant('{tmp}\ClaudeCodeUsageCollector.xml');
-  xml :=
-    '<?xml version="1.0" encoding="UTF-8"?>' + #13#10 +
-    '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + #13#10 +
-    '  <RegistrationInfo>' + #13#10 +
-    '    <Description>Claude Code Usage Collector - pushes new usage data every {#TaskIntervalMin} minutes</Description>' + #13#10 +
-    '  </RegistrationInfo>' + #13#10 +
-    '  <Triggers>' + #13#10 +
-    '    <TimeTrigger>' + #13#10 +
-    '      <Repetition>' + #13#10 +
-    '        <Interval>PT{#TaskIntervalMin}M</Interval>' + #13#10 +
-    '        <StopAtDurationEnd>false</StopAtDurationEnd>' + #13#10 +
-    '      </Repetition>' + #13#10 +
-    '      <StartBoundary>2026-01-01T00:00:00</StartBoundary>' + #13#10 +
-    '      <Enabled>true</Enabled>' + #13#10 +
-    '    </TimeTrigger>' + #13#10 +
-    '  </Triggers>' + #13#10 +
-    '  <Principals>' + #13#10 +
-    '    <Principal id="Author">' + #13#10 +
-    '      <LogonType>InteractiveToken</LogonType>' + #13#10 +
-    '      <RunLevel>HighestAvailable</RunLevel>' + #13#10 +
-    '    </Principal>' + #13#10 +
-    '  </Principals>' + #13#10 +
-    '  <Settings>' + #13#10 +
-    '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>' + #13#10 +
-    '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' + #13#10 +
-    '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + #13#10 +
-    '    <AllowHardTerminate>true</AllowHardTerminate>' + #13#10 +
-    '    <StartWhenAvailable>true</StartWhenAvailable>' + #13#10 +
-    '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>' + #13#10 +
-    '    <IdleSettings>' + #13#10 +
-    '      <StopOnIdleEnd>true</StopOnIdleEnd>' + #13#10 +
-    '      <RestartOnIdle>false</RestartOnIdle>' + #13#10 +
-    '    </IdleSettings>' + #13#10 +
-    '    <AllowStartOnDemand>true</AllowStartOnDemand>' + #13#10 +
-    '    <Enabled>true</Enabled>' + #13#10 +
-    '    <Hidden>false</Hidden>' + #13#10 +
-    '    <RunOnlyIfIdle>false</RunOnlyIfIdle>' + #13#10 +
-    '    <WakeToRun>false</WakeToRun>' + #13#10 +
-    '    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>' + #13#10 +
-    '    <Priority>7</Priority>' + #13#10 +
-    '  </Settings>' + #13#10 +
-    '  <Actions Context="Author">' + #13#10 +
-    '    <Exec>' + #13#10 +
-    '      <Command>' + exePath + '</Command>' + #13#10 +
-    '      <Arguments>push</Arguments>' + #13#10 +
-    '      <WorkingDirectory>' + ExpandConstant('{app}') + '</WorkingDirectory>' + #13#10 +
-    '    </Exec>' + #13#10 +
-    '  </Actions>' + #13#10 +
-    '</Task>' + #13#10;
-  { XML content above is pure ASCII, so byte-identical under ANSI / UTF-8 /
-    UTF-8-with-BOM-stripped. SaveStringToFile gives us all of those at once. }
-  SaveStringToFile(xmlPath, xml, False);
+  { v1.5 dropped the Scheduled Task XML generation -- autostart is via the
+    HKLM Run registry entry written by the [Registry] section. Each logged-in
+    user inherits that entry on logon and spawns their own daemon process
+    under their identity. }
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
