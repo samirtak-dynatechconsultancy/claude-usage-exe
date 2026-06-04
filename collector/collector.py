@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.7.3"
+USER_AGENT = "claude-usage-collector/1.7.4"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 DAEMON_LOCK_FILENAME = "daemon.lock"
 
@@ -64,6 +64,15 @@ DEFAULT_PROJECTS_DIRS = [
 # Vercel's 4.5 MB request body limit.
 INGEST_BATCH_SIZE = 50
 HTTP_TIMEOUT_S = 60
+
+# Inter-batch delay (seconds). Prevents rapid-fire requests from overwhelming
+# Vercel's serverless infrastructure, which returns FUNCTION_INVOCATION_FAILED
+# when a function is hit in rapid succession for sustained periods.
+BATCH_DELAY_S = 1.0
+
+# Retry config for transient HTTP failures (5xx, timeouts, network errors).
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 5     # first retry after 5s, then 10s, then 20s
 
 
 # ── Config loading ──────────────────────────────────────────────────────────
@@ -439,22 +448,52 @@ def _http(method: str, url: str, headers: Dict[str, str], body: Optional[bytes] 
 
 
 def api_ingest(cfg: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST a batch to /api/ingest with retry on transient failures.
+
+    Retries on HTTP 5xx and network errors with exponential backoff.
+    4xx errors are permanent and raised immediately (no retry).
+    """
     body = json.dumps(payload).encode("utf-8")
     if len(body) > 4_400_000:
         raise CollectorError(
             f"Ingest payload too large ({len(body)} bytes); reduce INGEST_BATCH_SIZE")
-    status, raw = _http(
-        "POST",
-        cfg["server_url"].rstrip("/") + "/api/ingest",
-        headers={
-            "Content-Type":   "application/json",
-            "X-Ingest-Token": cfg["ingest_token"],
-        },
-        body=body,
-    )
-    if status != 200:
-        raise CollectorError(f"/api/ingest failed: HTTP {status} {raw[:300]!r}")
-    return json.loads(raw)
+
+    url = cfg["server_url"].rstrip("/") + "/api/ingest"
+    headers = {
+        "Content-Type":   "application/json",
+        "X-Ingest-Token": cfg["ingest_token"],
+    }
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            status, raw = _http("POST", url, headers=headers, body=body)
+        except (URLError, OSError) as e:
+            # Network-level failure (DNS, connection refused, timeout, etc.)
+            last_err = e
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                log(f"  network error on attempt {attempt}/{MAX_RETRIES}: {e} -- retrying in {wait}s", level="WARN")
+                time.sleep(wait)
+                continue
+            raise CollectorError(f"/api/ingest network error after {MAX_RETRIES} attempts: {e}")
+
+        if status == 200:
+            return json.loads(raw)
+
+        # 4xx = client error, permanent — don't retry
+        if 400 <= status < 500:
+            raise CollectorError(f"/api/ingest failed: HTTP {status} {raw[:300]!r}")
+
+        # 5xx = server error, transient — retry with backoff
+        last_err = CollectorError(f"HTTP {status} {raw[:300]!r}")
+        if attempt < MAX_RETRIES:
+            wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+            log(f"  server error on attempt {attempt}/{MAX_RETRIES}: HTTP {status} -- retrying in {wait}s", level="WARN")
+            time.sleep(wait)
+            continue
+
+    raise CollectorError(f"/api/ingest failed after {MAX_RETRIES} attempts: {last_err}")
 
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -674,6 +713,24 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
             return result
 
         # ── POST in batches ────────────────────────────────────────────────
+        # v1.7.4: inter-batch delay + retry-with-backoff.
+        #
+        # Without a delay, rapid-fire requests overwhelm Vercel's serverless
+        # infra and it returns FUNCTION_INVOCATION_FAILED after ~40 batches
+        # (observed in v1.7.3 on a 290-batch re-push). A 1-second pause
+        # between batches keeps the throughput high (~50 turns/sec) while
+        # avoiding the thundering-herd failure.
+        #
+        # Retry logic lives in api_ingest(); transient 5xx and network
+        # errors get 3 attempts with exponential backoff before giving up.
+        #
+        # State is saved all-or-nothing at the end: state["files"] is
+        # pre-staged in memory during parsing (above), so a mid-push crash
+        # means the next daemon tick re-processes and re-sends everything.
+        # The server dedupes on message_id so re-sends are harmless — just
+        # slow for the one-time migration push. Future incremental pushes
+        # are tiny and complete in seconds.
+
         sessions_list = list(sessions_acc.values())
         total_batches = max(
             1,
@@ -702,6 +759,10 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
                 f"{len(payload['turns'])} turns, {len(payload['records'])} records -> "
                 f"server got {resp.get('turns_received')}t / {resp.get('messages_received')}m"
             )
+
+            # Throttle: avoid hammering Vercel. Skip delay after the last batch.
+            if i < total_batches - 1:
+                time.sleep(BATCH_DELAY_S)
 
         save_state(state)
         result.update({

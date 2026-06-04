@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.7.3"
+#define MyAppVersion    "1.7.4"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
