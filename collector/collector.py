@@ -25,11 +25,13 @@ Reads config from (first match wins):
 from __future__ import annotations
 
 import argparse
+import atexit
 import glob
 import hashlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -44,8 +46,15 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.5"
+USER_AGENT = "claude-usage-collector/1.7.3"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
+DAEMON_LOCK_FILENAME = "daemon.lock"
+
+# WTS_INFO_CLASS values for WTSQuerySessionInformation. Used by the live
+# CLIENTNAME check that catches RDP session takeover.
+WTS_CURRENT_SERVER  = 0
+WTS_CURRENT_SESSION = 0xFFFFFFFF
+WTSClientName       = 10
 DEFAULT_PROJECTS_DIRS = [
     Path.home() / ".claude" / "projects",
     Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects",
@@ -116,21 +125,22 @@ def _safe_dirname(s: str) -> str:
 
 
 def _state_path() -> Path:
-    """Per-CLIENTNAME state file.
+    """Single state file per OS account.
 
-    On a shared-OS-user RDP host, multiple RDP sessions land in the same
-    %LOCALAPPDATA% (they share an OS user). Without scoping by CLIENTNAME
-    they'd trample each other's state.json. Each client device gets its
-    own subdir so co-located sessions don't interfere.
+    v1.7.2 partitioned this by CLIENTNAME to handle "multiple RDP clients
+    sharing one OS account". v1.7.3 dropped that: Windows lets only one
+    client be Active on a given account at a time (the second client
+    bumps the first into Disconnected and reattaches to the same session),
+    and identity is now read live from the WTS API at each push -- so
+    state.json's job is just "what files have we already processed on
+    this %LOCALAPPDATA%", which is unambiguously one-per-OS-account.
+
+    Orphaned per-CLIENTNAME state.json files from a v1.7.2 install are
+    harmless: ignored on read, and the worst case is a one-time re-push
+    of historical turns (server dedupes by message_id).
     """
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
-    root = Path(base) / APP_NAME
-
-    clientname = (os.environ.get("CLIENTNAME") or "").strip()
-    if clientname and clientname.lower() != "console":
-        p = root / "clients" / _safe_dirname(clientname) / "state.json"
-    else:
-        p = root / "state.json"
+    p = Path(base) / APP_NAME / "state.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -169,9 +179,16 @@ def detect_user() -> Dict[str, str]:
 
     Priority order:
       1. CLAUDE_USAGE_USER env var (explicit override)
-      2. %CLIENTNAME% (RDP source device -- on a shared-OS-user RDP host
-         this is the only signal that distinguishes Alice from Bob)
-      3. getpass.getuser() (physical laptop / non-RDP login)
+      2. Live WTSQuerySessionInformation(WTSClientName) -- the currently
+         attached RDP client. Reflects session takeover (disconnect/
+         reconnect with a different client on the same OS account), which
+         the env block does NOT: %CLIENTNAME% in os.environ is a snapshot
+         frozen at process spawn and Windows never rewrites it for live
+         processes. The whole RDP-shared-account bug came from trusting
+         env over the live WTS value.
+      3. %CLIENTNAME% env var (fallback for non-Windows builds or weird
+         WTS failures; rarely the right answer on Windows).
+      4. getpass.getuser() (physical laptop / non-RDP login).
     """
     import getpass
 
@@ -179,9 +196,13 @@ def detect_user() -> Dict[str, str]:
     if explicit:
         return {"os_username": explicit, "identity_source": "explicit"}
 
+    live = _wts_get_current_clientname()
+    if live and live.lower() not in ("", "console"):
+        return {"os_username": live, "identity_source": "clientname_wts"}
+
     clientname = (os.environ.get("CLIENTNAME") or "").strip()
     if clientname and clientname.lower() != "console":
-        return {"os_username": clientname, "identity_source": "clientname"}
+        return {"os_username": clientname, "identity_source": "clientname_env"}
 
     return {
         "os_username":     (getpass.getuser() or "unknown").strip(),
@@ -192,11 +213,18 @@ def detect_user() -> Dict[str, str]:
 def detect_machine(machine_fp: str) -> Dict[str, Any]:
     """Capture hostname + RDP session info if applicable.
 
+    Prefers the LIVE WTS CLIENTNAME over the env snapshot, for the same
+    reason detect_user() does -- the env value is frozen at process spawn
+    and doesn't reflect disconnect/reconnect session takeovers.
+
     is_rdp is true when either:
       - SESSIONNAME starts with 'RDP-' (Windows tags RDP session names this way), or
-      - CLIENTNAME is set to anything other than 'Console'.
+      - CLIENTNAME (live or env) is set to anything other than 'Console'.
     """
-    clientname  = (os.environ.get("CLIENTNAME")  or "").strip()
+    live_client = _wts_get_current_clientname()
+    env_client  = (os.environ.get("CLIENTNAME") or "").strip()
+    clientname  = (live_client or env_client or "").strip()
+
     sessionname = (os.environ.get("SESSIONNAME") or "").strip()
     is_rdp = sessionname.startswith("RDP-") or (
         bool(clientname) and clientname.lower() != "console"
@@ -388,7 +416,7 @@ def parse_jsonl_file(
                     else:
                         turns_no_id.append(turn)
     except Exception as e:
-        log(f"  warning: error reading {filepath}: {e}")
+        log(f"  warning: error reading {filepath}: {e}", level="WARN")
 
     turns = turns_no_id + list(seen_messages.values())
     return list(session_meta.values()), turns, records, line_count
@@ -433,6 +461,14 @@ def api_ingest(cfg: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
 
 _LOG_FILE: Optional[Path] = None
 
+# Push-iteration counter + identity tracking. Lets us number pushes in the log
+# so a user reading collector.log in Notepad can ctrl-F "PUSH #42" to jump
+# straight to a specific iteration, and tells us when the resolved identity
+# changed between pushes (the smoking gun for an RDP session takeover).
+_PUSH_SEQ          = 0
+_LAST_IDENTITY: Optional[str] = None
+_FIRST_WTS_LOG     = True
+
 
 def _log_path() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
@@ -441,14 +477,32 @@ def _log_path() -> Path:
     return p
 
 
-def log(msg: str) -> None:
+def log(msg: str, level: str = "INFO", section: bool = False) -> None:
+    """Append a line to the rotating log.
+
+    Two formats, chosen so the file is scannable in plain Notepad:
+
+      [timestamp] LEVEL  message            <- normal events
+      [timestamp] ===== HEADER =====        <- section boundaries (push start/end)
+
+    Quick triage cheatsheet for collector.log:
+      - 'ERROR '  -> failures (HTTP, IO, exceptions). Search for these first.
+      - 'WARN  '  -> drifts / identity changes / non-fatal issues.
+      - '===== '  -> push iteration boundaries; PUSH #N OK/FAIL marks results.
+      - '!!!   '  -> identity changed (RDP takeover) -- visually unmissable.
+    """
     global _LOG_FILE
     if _LOG_FILE is None:
         _LOG_FILE = _log_path()
     # datetime.utcnow() is deprecated in 3.12+; use timezone-aware now() and
     # format manually to keep the same "...Z" suffix the user sees in logs.
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    line = f"[{ts}] {msg}"
+    if section:
+        line = f"[{ts}] ===== {msg} ====="
+    else:
+        # Pad level to width 5 so the message column is aligned regardless of
+        # whether the level is INFO/WARN (4 chars) or ERROR (5 chars).
+        line = f"[{ts}] {level:<5} {msg}"
     print(line, flush=True)
     try:
         if _LOG_FILE.exists() and _LOG_FILE.stat().st_size > 5_000_000:
@@ -467,15 +521,54 @@ def log(msg: str) -> None:
 
 def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
     """Walk projects dirs, parse new content, POST batches to /api/ingest,
-    update local state. Idempotent — already-processed line ranges are
+    update local state. Idempotent -- already-processed line ranges are
     skipped via the per-file `lines` counter in state.json.
+
+    Wrapped in a try/finally so each iteration emits balanced "PUSH #N
+    START" and "PUSH #N OK/FAIL" section markers in the log; that way a
+    user reading collector.log in Notepad can visually pair the start of
+    a push with its result.
     """
+    global _PUSH_SEQ, _LAST_IDENTITY, _FIRST_WTS_LOG
+    _PUSH_SEQ += 1
+    push_id = _PUSH_SEQ
+    started_at = time.time()
+    result: Dict[str, Any] = {
+        "files": 0, "turns": 0, "records": 0, "sessions": 0, "batches": 0,
+    }
+
     state = load_state()
     machine_fp = state.get("machine_fp") or _make_machine_fp()
     state["machine_fp"] = machine_fp
 
     user = detect_user()
     machine = detect_machine(machine_fp)
+
+    identity_str = f"{user['os_username']} ({user['identity_source']})"
+
+    # First push of this daemon's life: dump the raw identity inputs. If the
+    # WTS live value differs from the env CLIENTNAME, this line is the
+    # confirmation that the v1.7.3 live-WTS fix is doing real work (would
+    # have silently misattributed under v1.7.2).
+    if _FIRST_WTS_LOG:
+        _FIRST_WTS_LOG = False
+        live   = _wts_get_current_clientname()
+        env_cn = (os.environ.get("CLIENTNAME") or "").strip()
+        log(
+            f"identity inputs: wts_live='{live or ''}' "
+            f"env_clientname='{env_cn}' chosen={identity_str}"
+        )
+
+    # Identity change banner. If the daemon survived a disconnect/reconnect
+    # with a different RDP client, this is the unmissable line that records
+    # it -- search for '!!!' in collector.log to find every takeover.
+    if _LAST_IDENTITY is not None and _LAST_IDENTITY != identity_str:
+        log(
+            f"!!!   identity changed: '{_LAST_IDENTITY}' -> '{identity_str}' "
+            f"(likely RDP takeover -- new client attached to the session)",
+            level="WARN",
+        )
+    _LAST_IDENTITY = identity_str
 
     # Privacy toggle (config.json: "upload_content": true | false).
     # Default true preserves v1.2.x behavior on upgrade. When false, we send
@@ -484,136 +577,158 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
     upload_content = bool(cfg.get("upload_content", True))
 
     log(
-        f"push: user={user['os_username']} machine={machine['hostname']} "
-        f"fp={machine_fp[:8]}… content_uploads={'on' if upload_content else 'off'}"
+        f"PUSH #{push_id} START - identity={identity_str} "
+        f"host={machine['hostname']} fp={machine_fp[:8]} "
+        f"content_uploads={'on' if upload_content else 'off'}",
+        section=True,
     )
 
-    # ── Discover files ────────────────────────────────────────────────────
-    projects_dirs = [Path(p) for p in cfg.get("projects_dirs") or []] or DEFAULT_PROJECTS_DIRS
-    jsonl_files: List[str] = []
-    for d in projects_dirs:
-        if not d.exists():
-            continue
-        jsonl_files.extend(glob.glob(str(d / "**" / "*.jsonl"), recursive=True))
-    jsonl_files.sort()
-    log(f"discovered {len(jsonl_files)} jsonl files across {len(projects_dirs)} dirs")
+    ok = False
+    try:
+        # ── Discover files ────────────────────────────────────────────────
+        projects_dirs = [Path(p) for p in cfg.get("projects_dirs") or []] or DEFAULT_PROJECTS_DIRS
+        jsonl_files: List[str] = []
+        for d in projects_dirs:
+            if not d.exists():
+                continue
+            jsonl_files.extend(glob.glob(str(d / "**" / "*.jsonl"), recursive=True))
+        jsonl_files.sort()
+        log(f"  discovered {len(jsonl_files)} jsonl files across {len(projects_dirs)} dirs")
 
-    new_or_changed: List[str] = []
-    for fp in jsonl_files:
-        try:
-            mtime = os.path.getmtime(fp)
-        except OSError:
-            continue
-        rec = state["files"].get(fp)
-        if rec and abs(rec.get("mtime", 0) - mtime) < 0.01:
-            continue
-        new_or_changed.append(fp)
-    log(f"{len(new_or_changed)} files need processing")
+        new_or_changed: List[str] = []
+        for fp in jsonl_files:
+            try:
+                mtime = os.path.getmtime(fp)
+            except OSError:
+                continue
+            rec = state["files"].get(fp)
+            if rec and abs(rec.get("mtime", 0) - mtime) < 0.01:
+                continue
+            new_or_changed.append(fp)
+        log(f"  {len(new_or_changed)} files need processing")
 
-    if dry_run:
-        return {"would_process": len(new_or_changed)}
+        if dry_run:
+            result["files"] = len(new_or_changed)
+            ok = True
+            return {"would_process": len(new_or_changed)}
 
-    sessions_acc: Dict[str, Dict[str, Any]] = {}
-    turns_acc: List[Dict[str, Any]] = []
-    records_acc: List[Dict[str, Any]] = []
-    file_records: List[Dict[str, Any]] = []
+        sessions_acc: Dict[str, Dict[str, Any]] = {}
+        turns_acc: List[Dict[str, Any]] = []
+        records_acc: List[Dict[str, Any]] = []
+        file_records: List[Dict[str, Any]] = []
 
-    parsed_files = 0
-    new_turn_count = 0
-    new_record_count = 0
+        parsed_files = 0
+        new_turn_count = 0
+        new_record_count = 0
 
-    for fp in new_or_changed:
-        try:
-            prev = state["files"].get(fp) or {}
-            skip_lines = int(prev.get("lines") or 0)
+        for fp in new_or_changed:
+            try:
+                prev = state["files"].get(fp) or {}
+                skip_lines = int(prev.get("lines") or 0)
 
-            metas, turns, records, lines = parse_jsonl_file(
-                fp, skip_lines=skip_lines, collect_content=upload_content,
-            )
-            parsed_files += 1
-            new_turn_count   += len(turns)
-            new_record_count += len(records)
+                metas, turns, records, lines = parse_jsonl_file(
+                    fp, skip_lines=skip_lines, collect_content=upload_content,
+                )
+                parsed_files += 1
+                new_turn_count   += len(turns)
+                new_record_count += len(records)
 
-            for m in metas:
-                ex = sessions_acc.get(m["session_uuid"])
-                if not ex:
-                    sessions_acc[m["session_uuid"]] = m
-                else:
-                    if m["first_timestamp"] and (not ex["first_timestamp"] or m["first_timestamp"] < ex["first_timestamp"]):
-                        ex["first_timestamp"] = m["first_timestamp"]
-                    if m["last_timestamp"] and (not ex["last_timestamp"] or m["last_timestamp"] > ex["last_timestamp"]):
-                        ex["last_timestamp"] = m["last_timestamp"]
-                    if _model_priority(m["model"]) > _model_priority(ex["model"]):
-                        ex["model"] = m["model"]
+                for m in metas:
+                    ex = sessions_acc.get(m["session_uuid"])
+                    if not ex:
+                        sessions_acc[m["session_uuid"]] = m
+                    else:
+                        if m["first_timestamp"] and (not ex["first_timestamp"] or m["first_timestamp"] < ex["first_timestamp"]):
+                            ex["first_timestamp"] = m["first_timestamp"]
+                        if m["last_timestamp"] and (not ex["last_timestamp"] or m["last_timestamp"] > ex["last_timestamp"]):
+                            ex["last_timestamp"] = m["last_timestamp"]
+                        if _model_priority(m["model"]) > _model_priority(ex["model"]):
+                            ex["model"] = m["model"]
 
-            turns_acc.extend(turns)
-            records_acc.extend(records)
-            file_records.append({
-                "path":  fp,
-                "mtime": os.path.getmtime(fp),
-                "lines": lines,
-            })
+                turns_acc.extend(turns)
+                records_acc.extend(records)
+                file_records.append({
+                    "path":  fp,
+                    "mtime": os.path.getmtime(fp),
+                    "lines": lines,
+                })
 
-            # Pre-stage state update; only commit to disk after successful
-            # ingest of the batches containing this file's data.
-            state["files"][fp] = {
-                "mtime": os.path.getmtime(fp),
-                "lines": lines,
-            }
-        except Exception as e:
-            log(f"  ERROR processing {fp}: {e}")
-            log(traceback.format_exc())
-            continue
+                # Pre-stage state update; only commit to disk after successful
+                # ingest of the batches containing this file's data.
+                state["files"][fp] = {
+                    "mtime": os.path.getmtime(fp),
+                    "lines": lines,
+                }
+            except Exception as e:
+                log(f"  error processing {fp}: {e}", level="ERROR")
+                log(traceback.format_exc(), level="ERROR")
+                continue
 
-    log(f"parsed: {parsed_files} files, {new_turn_count} new turns, {new_record_count} new records")
+        log(f"  parsed: {parsed_files} files, {new_turn_count} new turns, {new_record_count} new records")
 
-    if not turns_acc and not records_acc and not sessions_acc:
-        log("nothing to ingest")
-        save_state(state)
-        return {"files": parsed_files, "turns": 0, "records": 0, "sessions": 0}
+        if not turns_acc and not records_acc and not sessions_acc:
+            log("  nothing to ingest")
+            save_state(state)
+            result.update({"files": parsed_files})
+            ok = True
+            return result
 
-    # ── POST in batches ───────────────────────────────────────────────────
-    sessions_list = list(sessions_acc.values())
-    total_batches = max(
-        1,
-        (len(turns_acc)   + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
-        (len(records_acc) + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
-    )
-    batches_sent = 0
-
-    for i in range(total_batches):
-        t_start = i * INGEST_BATCH_SIZE
-        r_start = i * INGEST_BATCH_SIZE
-        # Sessions + file-records go with the FIRST batch only — they're
-        # full upserts and don't need re-sending.
-        payload = {
-            "user":            user,
-            "machine":         machine,
-            "sessions":        sessions_list if i == 0 else [],
-            "turns":           turns_acc[t_start:t_start + INGEST_BATCH_SIZE],
-            "records":         records_acc[r_start:r_start + INGEST_BATCH_SIZE],
-            "processed_files": file_records if i == 0 else [],
-        }
-        resp = api_ingest(cfg, payload)
-        batches_sent += 1
-        log(
-            f"  batch {batches_sent}/{total_batches}: "
-            f"{len(payload['turns'])} turns, {len(payload['records'])} records → "
-            f"server got {resp.get('turns_received')}t / {resp.get('messages_received')}m"
+        # ── POST in batches ────────────────────────────────────────────────
+        sessions_list = list(sessions_acc.values())
+        total_batches = max(
+            1,
+            (len(turns_acc)   + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
+            (len(records_acc) + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
         )
+        batches_sent = 0
 
-    save_state(state)
-    log(
-        f"push complete: {parsed_files} files, {new_turn_count} turns across "
-        f"{len(sessions_list)} sessions, {batches_sent} batches"
-    )
-    return {
-        "files":    parsed_files,
-        "turns":    new_turn_count,
-        "records":  new_record_count,
-        "sessions": len(sessions_list),
-        "batches":  batches_sent,
-    }
+        for i in range(total_batches):
+            t_start = i * INGEST_BATCH_SIZE
+            r_start = i * INGEST_BATCH_SIZE
+            # Sessions + file-records go with the FIRST batch only -- they're
+            # full upserts and don't need re-sending.
+            payload = {
+                "user":            user,
+                "machine":         machine,
+                "sessions":        sessions_list if i == 0 else [],
+                "turns":           turns_acc[t_start:t_start + INGEST_BATCH_SIZE],
+                "records":         records_acc[r_start:r_start + INGEST_BATCH_SIZE],
+                "processed_files": file_records if i == 0 else [],
+            }
+            resp = api_ingest(cfg, payload)
+            batches_sent += 1
+            log(
+                f"  batch {batches_sent}/{total_batches}: "
+                f"{len(payload['turns'])} turns, {len(payload['records'])} records -> "
+                f"server got {resp.get('turns_received')}t / {resp.get('messages_received')}m"
+            )
+
+        save_state(state)
+        result.update({
+            "files":    parsed_files,
+            "turns":    new_turn_count,
+            "records":  new_record_count,
+            "sessions": len(sessions_list),
+            "batches":  batches_sent,
+        })
+        ok = True
+        return result
+    finally:
+        elapsed = time.time() - started_at
+        if ok:
+            log(
+                f"PUSH #{push_id} OK in {elapsed:.1f}s - "
+                f"{result['turns']} turns across {result['sessions']} sessions, "
+                f"{result['batches']} batches",
+                section=True,
+            )
+        else:
+            log(
+                f"PUSH #{push_id} FAIL after {elapsed:.1f}s "
+                f"(see ERROR lines above for cause)",
+                level="ERROR",
+                section=True,
+            )
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -624,14 +739,135 @@ def cmd_push(args):
     push(cfg, dry_run=args.dry_run)
 
 
+# ── Daemon singleton lock ──────────────────────────────────────────────────
+
+def _daemon_lock_path() -> Path:
+    """Lock file lives next to state.json -- one lock per OS account. Windows
+    only allows one Active RDP client per account at a time, so a single
+    daemon serving "whoever is currently attached" is the right granularity.
+    """
+    return _state_path().parent / DAEMON_LOCK_FILENAME
+
+
+def _pid_is_collector(pid: int) -> bool:
+    """Cross-check whether a PID is alive AND belongs to a
+    ClaudeUsageCollector.exe process. Tasklist is the Windows-built-in
+    way to do this without psutil. We compare the image name to guard
+    against PID reuse: PIDs cycle, so a stale lock pointing at a number
+    that some unrelated process now uses must NOT block us."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return "ClaudeUsageCollector.exe" in (result.stdout or "")
+    except Exception:
+        # Last-resort POSIX-style probe -- doesn't tell us the image name,
+        # but at least tells us a process exists. Errs on the side of
+        # "another daemon is alive" when ambiguous; safer than racing.
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+def _release_daemon_lock(lock_path: Path, owner_pid: int) -> None:
+    """Best-effort cleanup. Only removes the lock if it still points at US,
+    so a daemon that's been replaced by a different instance doesn't yank
+    the active one's lock on exit."""
+    try:
+        if not lock_path.exists():
+            return
+        try:
+            current = int(lock_path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            return
+        if current == owner_pid:
+            lock_path.unlink()
+    except Exception:
+        pass
+
+
+def _acquire_daemon_lock() -> bool:
+    """Returns True if we successfully claimed the lock (i.e. no other daemon
+    is running on this OS account). False if another live daemon already
+    has it -- in which case the new daemon should exit cleanly."""
+    lock_path = _daemon_lock_path()
+    my_pid = os.getpid()
+
+    if lock_path.exists():
+        try:
+            existing_pid = int(lock_path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            existing_pid = None
+
+        if existing_pid and existing_pid != my_pid and _pid_is_collector(existing_pid):
+            log(f"another daemon is already running on this OS account (PID {existing_pid}); exiting")
+            return False
+        if existing_pid:
+            log(f"stale lock from PID {existing_pid} (no longer collector process); taking over")
+
+    try:
+        lock_path.write_text(str(my_pid), encoding="utf-8")
+    except OSError as e:
+        log(f"warning: couldn't write daemon lock at {lock_path}: {e}", level="WARN")
+        # Don't block startup on lock-file failure -- single-daemon is a nice
+        # property to have but not a correctness requirement.
+        return True
+
+    atexit.register(_release_daemon_lock, lock_path, my_pid)
+    return True
+
+
+def _wts_get_current_clientname() -> Optional[str]:
+    """Read the CURRENT session's CLIENTNAME from Win32 (not the cached env
+    block). The process env is a snapshot from spawn time, but Windows
+    updates a session's CLIENTNAME live on RDP reconnect/takeover. The WTS
+    API reflects that. Returns None on any failure -- caller treats that
+    as "unknown" and stays put.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        wtsapi = ctypes.windll.wtsapi32
+
+        buf = ctypes.c_void_p()
+        bytes_returned = ctypes.c_uint32()
+
+        ok = wtsapi.WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER,
+            WTS_CURRENT_SESSION,
+            WTSClientName,
+            ctypes.byref(buf),
+            ctypes.byref(bytes_returned),
+        )
+        if not ok or not buf.value:
+            return None
+        try:
+            value = ctypes.wstring_at(buf.value)
+            return (value or "").strip() or None
+        finally:
+            wtsapi.WTSFreeMemory(buf)
+    except Exception:
+        return None
+
+
 def cmd_daemon(args):
     """Run forever, pushing every N seconds.
 
     This is the default mode for v1.5+ installs -- the installer registers
     an HKLM Run entry that starts 'ClaudeUsageCollector.exe daemon' on
-    every login. The process lives until the user logs off. On an RDP host
-    with N concurrent users, each user has their own daemon in their own
-    session, each pushing as their own CLIENTNAME identity.
+    every login. The process lives until the user logs off.
+
+    On an RDP host with a shared OS account, there's still only one
+    daemon: Windows only lets one client be Active on a given account at
+    a time (a second client reconnects to the same session). The daemon
+    tracks "who's currently attached" by re-reading the live WTS
+    CLIENTNAME inside detect_user() on every push, so disconnect +
+    reconnect with a different client is handled without a restart.
 
     Config loading is retried indefinitely with a 10-second backoff. This
     is defense-in-depth against the install-time race that bit v1.6.0,
@@ -643,6 +879,12 @@ def cmd_daemon(args):
     by hand, etc.).
     """
     log(f"daemon starting (interval: {args.interval}s)")
+
+    # Singleton lock -- refuse to start if another daemon is already running
+    # on this OS account. Prevents the "four daemons stacked" scenario where
+    # manual restarts + HKLM Run autostarts accumulate.
+    if not _acquire_daemon_lock():
+        return
 
     cfg = None
     config_path = None
@@ -667,6 +909,11 @@ def cmd_daemon(args):
     user = detect_user()
     log(f"daemon identity: os_username={user['os_username']} source={user.get('identity_source')}")
 
+    # Identity is re-detected inside push() on every iteration via
+    # detect_user(), which now reads the live WTS CLIENTNAME. The daemon
+    # process can outlive a session disconnect+reconnect and still attribute
+    # subsequent turns to whoever's currently attached -- no respawn dance,
+    # no env snapshot to go stale.
     while True:
         try:
             push(cfg)
@@ -674,8 +921,8 @@ def cmd_daemon(args):
             log("daemon interrupted, exiting")
             return
         except Exception as e:
-            log(f"daemon push iteration failed: {e}")
-            log(traceback.format_exc())
+            log(f"daemon push iteration failed: {e}", level="ERROR")
+            log(traceback.format_exc(), level="ERROR")
         try:
             time.sleep(args.interval)
         except KeyboardInterrupt:
@@ -696,8 +943,27 @@ def cmd_status(args):
     state = load_state()
     print(f"\nMachine fp:    {state.get('machine_fp')}")
     print(f"State file:    {_state_path()}")
+    print(f"Lock file:     {_daemon_lock_path()}")
     print(f"Files tracked: {len(state.get('files', {}))}")
     print(f"Log file:      {_log_path()}")
+
+    # Identity diagnostic. Run this on a misattributing RDP host to see in
+    # one shot which signal is winning. If wts_live != env_clientname, you're
+    # looking at a session that was taken over by a different RDP client
+    # after the daemon spawned -- and v1.7.3 should be picking the wts_live
+    # value as the chosen identity.
+    machine_fp = state.get("machine_fp") or _make_machine_fp()
+    user = detect_user()
+    machine = detect_machine(machine_fp)
+    print("\nIdentity:")
+    print(f"  chosen os_username: {user['os_username']}")
+    print(f"  identity_source:    {user.get('identity_source')}")
+    print(f"  wts_live:           {_wts_get_current_clientname() or '(none / not RDP)'}")
+    print(f"  env_CLIENTNAME:     {os.environ.get('CLIENTNAME', '(unset)')}")
+    print(f"  env_SESSIONNAME:    {os.environ.get('SESSIONNAME', '(unset)')}")
+    print(f"  is_rdp:             {machine.get('is_rdp')}")
+    print(f"  client_machine:     {machine.get('client_machine', '(none)')}")
+    print(f"  hostname:           {machine.get('hostname')}")
 
 
 def cmd_reset(args):
@@ -733,11 +999,11 @@ def main(argv=None):
     try:
         args.func(args)
     except CollectorError as e:
-        log(f"FATAL: {e}")
+        log(f"FATAL: {e}", level="ERROR")
         sys.exit(1)
     except Exception as e:
-        log(f"UNHANDLED EXCEPTION: {e}")
-        log(traceback.format_exc())
+        log(f"UNHANDLED EXCEPTION: {e}", level="ERROR")
+        log(traceback.format_exc(), level="ERROR")
         sys.exit(2)
 
 
