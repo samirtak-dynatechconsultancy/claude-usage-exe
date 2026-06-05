@@ -46,8 +46,9 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.7.4"
+USER_AGENT = "claude-usage-collector/1.7.5"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
+IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
 
 # WTS_INFO_CLASS values for WTSQuerySessionInformation. Used by the live
@@ -183,6 +184,19 @@ def _make_machine_fp() -> str:
 
 # ── Identification ──────────────────────────────────────────────────────────
 
+# Last known WTS CLIENTNAME. When the RDP session disconnects, WTS returns
+# empty -- but we still know who was last attached. This is more trustworthy
+# than the env CLIENTNAME (frozen at process spawn, could be a completely
+# different user). Persisted in-memory across the daemon's lifetime.
+_last_wts_identity: Optional[str] = None
+
+# Identity timeline: [(iso_timestamp, user_dict, machine_dict)].
+# Built by polling identity every IDENTITY_POLL_S seconds between pushes.
+# push() uses this to attribute each turn/record to the identity that was
+# active at its timestamp, not the identity at push time.
+_identity_timeline: List[Tuple[str, Dict[str, str], Dict[str, Any]]] = []
+
+
 def detect_user() -> Dict[str, str]:
     """Resolve the user identifier for this collector instance.
 
@@ -195,10 +209,13 @@ def detect_user() -> Dict[str, str]:
          frozen at process spawn and Windows never rewrites it for live
          processes. The whole RDP-shared-account bug came from trusting
          env over the live WTS value.
-      3. %CLIENTNAME% env var (fallback for non-Windows builds or weird
+      3. Last known WTS value (session disconnected but we remember who
+         was last attached — more reliable than stale env).
+      4. %CLIENTNAME% env var (fallback for non-Windows builds or weird
          WTS failures; rarely the right answer on Windows).
-      4. getpass.getuser() (physical laptop / non-RDP login).
+      5. getpass.getuser() (physical laptop / non-RDP login).
     """
+    global _last_wts_identity
     import getpass
 
     explicit = (os.environ.get("CLAUDE_USAGE_USER") or "").strip()
@@ -207,7 +224,13 @@ def detect_user() -> Dict[str, str]:
 
     live = _wts_get_current_clientname()
     if live and live.lower() not in ("", "console"):
+        _last_wts_identity = live
         return {"os_username": live, "identity_source": "clientname_wts"}
+
+    # WTS returned empty (session disconnected). Use the last known WTS
+    # identity — it's the most recent person who was actually attached.
+    if _last_wts_identity:
+        return {"os_username": _last_wts_identity, "identity_source": "clientname_wts_cached"}
 
     clientname = (os.environ.get("CLIENTNAME") or "").strip()
     if clientname and clientname.lower() != "console":
@@ -252,6 +275,59 @@ def detect_machine(machine_fp: str) -> Dict[str, Any]:
             payload["session_id"]     = sessionname
             payload["rdp_session_id"] = sessionname
     return payload
+
+
+# ── Identity timeline helpers ───────────────────────────────────────────────
+
+def poll_identity(machine_fp: str) -> None:
+    """Sample the current identity and append to _identity_timeline if changed.
+
+    Called every IDENTITY_POLL_S seconds between pushes so the timeline has
+    ~30-second resolution. push() uses this to attribute each turn to the
+    identity that was active at its timestamp.
+    """
+    user = detect_user()
+    machine = detect_machine(machine_fp)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if _identity_timeline:
+        prev_user = _identity_timeline[-1][1]
+        if prev_user["os_username"] == user["os_username"]:
+            return  # no change — don't bloat the timeline
+
+    _identity_timeline.append((now, user, machine))
+
+    if len(_identity_timeline) >= 2:
+        prev = _identity_timeline[-2][1]["os_username"]
+        curr = user["os_username"]
+        log(
+            f"!!!   identity changed: '{prev}' -> '{curr}' "
+            f"(source: {user['identity_source']})",
+            level="WARN",
+        )
+
+
+def identity_at(timestamp: str) -> Tuple[Optional[Dict[str, str]], Optional[Dict[str, Any]]]:
+    """Look up the identity that was active at the given ISO timestamp.
+
+    Walks the timeline backwards to find the latest transition that was
+    at-or-before the given timestamp. If the timestamp is before the
+    earliest entry (turns from before the daemon started), returns the
+    earliest known identity (best guess).
+
+    Returns (user_dict, machine_dict) or (None, None) if timeline is empty.
+    """
+    if not _identity_timeline:
+        return None, None
+
+    # Default to the earliest entry (covers turns from before daemon start).
+    best_user, best_machine = _identity_timeline[0][1], _identity_timeline[0][2]
+    for entry_ts, user, machine in _identity_timeline:
+        if entry_ts <= timestamp:
+            best_user, best_machine = user, machine
+        else:
+            break
+    return best_user, best_machine
 
 
 # ── JSONL parsing ───────────────────────────────────────────────────────────
@@ -712,57 +788,106 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
             ok = True
             return result
 
-        # ── POST in batches ────────────────────────────────────────────────
+        # ── Group turns/records by identity ───────────────────────────────
+        # v1.7.5: per-turn identity attribution using the timeline built by
+        # the daemon's identity polling. Each turn is attributed to the
+        # identity that was active at the turn's timestamp, not the identity
+        # at push time. This means User A's messages stay attributed to A
+        # even if User B connected by the time the push fires.
+        #
+        # If the timeline is empty (one-shot `push` command, not daemon mode)
+        # or has only one entry, all turns get the current identity — same as
+        # v1.7.4 behavior. The grouping only kicks in when the timeline
+        # recorded a transition.
+
+        # Group key: os_username string.
+        # Each group carries its own user/machine dicts + turns + records.
+        identity_groups: Dict[str, Dict[str, Any]] = {}
+
+        def _get_or_create_group(ts: Optional[str]) -> Dict[str, Any]:
+            """Return the identity group for a given timestamp."""
+            u, m = identity_at(ts) if ts else (None, None)
+            if u is None:
+                u, m = user, machine  # fallback to push-time identity
+            key = u["os_username"]
+            if key not in identity_groups:
+                identity_groups[key] = {
+                    "user": u, "machine": m,
+                    "turns": [], "records": [], "session_uuids": set(),
+                }
+            return identity_groups[key]
+
+        for t in turns_acc:
+            g = _get_or_create_group(t.get("timestamp"))
+            g["turns"].append(t)
+            g["session_uuids"].add(t.get("session_uuid"))
+
+        for r in records_acc:
+            g = _get_or_create_group(r.get("timestamp"))
+            g["records"].append(r)
+            g["session_uuids"].add(r.get("session_uuid"))
+
+        # If everyone landed in a single group (common case), this is the
+        # same as v1.7.4's behavior but with one extra dict lookup.
+        group_count = len(identity_groups)
+        if group_count > 1:
+            log(f"  identity split: {group_count} distinct users in this push:")
+            for key, g in identity_groups.items():
+                log(f"    {key} ({g['user']['identity_source']}): "
+                    f"{len(g['turns'])} turns, {len(g['records'])} records")
+
+        # ── POST in batches (per identity group) ──────────────────────────
         # v1.7.4: inter-batch delay + retry-with-backoff.
-        #
-        # Without a delay, rapid-fire requests overwhelm Vercel's serverless
-        # infra and it returns FUNCTION_INVOCATION_FAILED after ~40 batches
-        # (observed in v1.7.3 on a 290-batch re-push). A 1-second pause
-        # between batches keeps the throughput high (~50 turns/sec) while
-        # avoiding the thundering-herd failure.
-        #
-        # Retry logic lives in api_ingest(); transient 5xx and network
-        # errors get 3 attempts with exponential backoff before giving up.
-        #
-        # State is saved all-or-nothing at the end: state["files"] is
-        # pre-staged in memory during parsing (above), so a mid-push crash
-        # means the next daemon tick re-processes and re-sends everything.
-        # The server dedupes on message_id so re-sends are harmless — just
-        # slow for the one-time migration push. Future incremental pushes
-        # are tiny and complete in seconds.
-
         sessions_list = list(sessions_acc.values())
-        total_batches = max(
-            1,
-            (len(turns_acc)   + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
-            (len(records_acc) + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
-        )
         batches_sent = 0
+        total_turns_sent = 0
+        total_records_sent = 0
+        first_group = True
 
-        for i in range(total_batches):
-            t_start = i * INGEST_BATCH_SIZE
-            r_start = i * INGEST_BATCH_SIZE
-            # Sessions + file-records go with the FIRST batch only -- they're
-            # full upserts and don't need re-sending.
-            payload = {
-                "user":            user,
-                "machine":         machine,
-                "sessions":        sessions_list if i == 0 else [],
-                "turns":           turns_acc[t_start:t_start + INGEST_BATCH_SIZE],
-                "records":         records_acc[r_start:r_start + INGEST_BATCH_SIZE],
-                "processed_files": file_records if i == 0 else [],
-            }
-            resp = api_ingest(cfg, payload)
-            batches_sent += 1
-            log(
-                f"  batch {batches_sent}/{total_batches}: "
-                f"{len(payload['turns'])} turns, {len(payload['records'])} records -> "
-                f"server got {resp.get('turns_received')}t / {resp.get('messages_received')}m"
+        for group_key, group in identity_groups.items():
+            g_user    = group["user"]
+            g_machine = group["machine"]
+            g_turns   = group["turns"]
+            g_records = group["records"]
+
+            # Only include sessions that have turns in THIS identity group.
+            g_session_uuids = group["session_uuids"]
+            g_sessions = [s for s in sessions_list if s["session_uuid"] in g_session_uuids]
+
+            g_total_batches = max(
+                1,
+                (len(g_turns)   + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
+                (len(g_records) + INGEST_BATCH_SIZE - 1) // INGEST_BATCH_SIZE,
             )
 
-            # Throttle: avoid hammering Vercel. Skip delay after the last batch.
-            if i < total_batches - 1:
-                time.sleep(BATCH_DELAY_S)
+            for i in range(g_total_batches):
+                t_start = i * INGEST_BATCH_SIZE
+                r_start = i * INGEST_BATCH_SIZE
+                payload = {
+                    "user":            g_user,
+                    "machine":         g_machine,
+                    "sessions":        g_sessions if i == 0 else [],
+                    "turns":           g_turns[t_start:t_start + INGEST_BATCH_SIZE],
+                    "records":         g_records[r_start:r_start + INGEST_BATCH_SIZE],
+                    "processed_files": file_records if first_group and i == 0 else [],
+                }
+                resp = api_ingest(cfg, payload)
+                batches_sent += 1
+                total_turns_sent   += len(payload["turns"])
+                total_records_sent += len(payload["records"])
+
+                identity_tag = f" [{group_key}]" if group_count > 1 else ""
+                log(
+                    f"  batch {batches_sent}{identity_tag}: "
+                    f"{len(payload['turns'])} turns, {len(payload['records'])} records -> "
+                    f"server got {resp.get('turns_received')}t / {resp.get('messages_received')}m"
+                )
+
+                # Throttle: avoid hammering Vercel.
+                if not (i == g_total_batches - 1 and group_key == list(identity_groups.keys())[-1]):
+                    time.sleep(BATCH_DELAY_S)
+
+            first_group = False
 
         save_state(state)
         result.update({
@@ -967,14 +1092,23 @@ def cmd_daemon(args):
                 return
 
     log(f"daemon: config loaded from {config_path}")
+
+    state = load_state()
+    machine_fp = state.get("machine_fp") or _make_machine_fp()
+
+    # Seed the identity timeline with the current identity so push() has
+    # at least one entry even on the very first run.
+    poll_identity(machine_fp)
     user = detect_user()
     log(f"daemon identity: os_username={user['os_username']} source={user.get('identity_source')}")
 
-    # Identity is re-detected inside push() on every iteration via
-    # detect_user(), which now reads the live WTS CLIENTNAME. The daemon
-    # process can outlive a session disconnect+reconnect and still attribute
-    # subsequent turns to whoever's currently attached -- no respawn dance,
-    # no env snapshot to go stale.
+    # v1.7.5: the daemon polls identity every IDENTITY_POLL_S seconds between
+    # pushes. push() uses the timeline to attribute each turn to the identity
+    # that was active at its timestamp — so User A's messages stay attributed
+    # to A even if User B connected by the time the push fires.
+    interval = args.interval
+    polls_per_push = max(1, interval // IDENTITY_POLL_S)
+
     while True:
         try:
             push(cfg)
@@ -984,8 +1118,13 @@ def cmd_daemon(args):
         except Exception as e:
             log(f"daemon push iteration failed: {e}", level="ERROR")
             log(traceback.format_exc(), level="ERROR")
+
+        # Poll identity every IDENTITY_POLL_S seconds until the next push.
+        # This builds the timeline that push() uses for per-turn attribution.
         try:
-            time.sleep(args.interval)
+            for _ in range(polls_per_push):
+                time.sleep(IDENTITY_POLL_S)
+                poll_identity(machine_fp)
         except KeyboardInterrupt:
             log("daemon interrupted during sleep, exiting")
             return
