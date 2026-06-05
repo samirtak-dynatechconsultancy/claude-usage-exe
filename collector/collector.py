@@ -279,6 +279,8 @@ def detect_machine(machine_fp: str) -> Dict[str, Any]:
 
 # ── Identity timeline helpers ───────────────────────────────────────────────
 
+_identity_poll_count = 0   # how many polls since last push
+
 def poll_identity(machine_fp: str) -> None:
     """Sample the current identity and append to _identity_timeline if changed.
 
@@ -286,6 +288,9 @@ def poll_identity(machine_fp: str) -> None:
     ~30-second resolution. push() uses this to attribute each turn to the
     identity that was active at its timestamp.
     """
+    global _identity_poll_count
+    _identity_poll_count += 1
+
     user = detect_user()
     machine = detect_machine(machine_fp)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -293,9 +298,16 @@ def poll_identity(machine_fp: str) -> None:
     if _identity_timeline:
         prev_user = _identity_timeline[-1][1]
         if prev_user["os_username"] == user["os_username"]:
+            # Log a heartbeat every 5 minutes (10 polls × 30s) to confirm
+            # the polling loop is alive, even when identity doesn't change.
+            if _identity_poll_count % 10 == 0:
+                log(f"  identity poll #{_identity_poll_count}: "
+                    f"still {user['os_username']} ({user['identity_source']})")
             return  # no change — don't bloat the timeline
 
     _identity_timeline.append((now, user, machine))
+    log(f"  identity poll: set to {user['os_username']} ({user['identity_source']}) "
+        f"[timeline entries: {len(_identity_timeline)}]")
 
     if len(_identity_timeline) >= 2:
         prev = _identity_timeline[-2][1]["os_username"]
@@ -691,12 +703,20 @@ def push(cfg: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
     # word of any prompt or response.
     upload_content = bool(cfg.get("upload_content", True))
 
+    # Log timeline state so the user can see the polling is working.
+    tl_summary = ", ".join(
+        f"{ts[:19]}={u['os_username']}" for ts, u, _ in _identity_timeline
+    ) if _identity_timeline else "(empty — one-shot mode)"
     log(
         f"PUSH #{push_id} START - identity={identity_str} "
         f"host={machine['hostname']} fp={machine_fp[:8]} "
-        f"content_uploads={'on' if upload_content else 'off'}",
+        f"content_uploads={'on' if upload_content else 'off'} "
+        f"timeline=[{tl_summary}]",
         section=True,
     )
+
+    global _identity_poll_count
+    _identity_poll_count = 0   # reset poll counter for the next interval
 
     ok = False
     try:
@@ -1108,6 +1128,7 @@ def cmd_daemon(args):
     # to A even if User B connected by the time the push fires.
     interval = args.interval
     polls_per_push = max(1, interval // IDENTITY_POLL_S)
+    log(f"daemon: identity polling every {IDENTITY_POLL_S}s ({polls_per_push} polls per push cycle)")
 
     while True:
         try:
