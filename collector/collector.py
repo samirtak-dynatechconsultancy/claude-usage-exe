@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.7.5"
+USER_AGENT = "claude-usage-collector/1.7.6"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -197,6 +197,12 @@ _last_wts_identity: Optional[str] = None
 _identity_timeline: List[Tuple[str, Dict[str, str], Dict[str, Any]]] = []
 
 
+def _is_console_session() -> bool:
+    """True when SESSIONNAME indicates a local console login (not RDP)."""
+    sn = (os.environ.get("SESSIONNAME") or "").strip().lower()
+    return sn.startswith("console") or sn == ""
+
+
 def detect_user() -> Dict[str, str]:
     """Resolve the user identifier for this collector instance.
 
@@ -214,6 +220,10 @@ def detect_user() -> Dict[str, str]:
       4. %CLIENTNAME% env var (fallback for non-Windows builds or weird
          WTS failures; rarely the right answer on Windows).
       5. getpass.getuser() (physical laptop / non-RDP login).
+
+    Steps 2-4 are skipped when SESSIONNAME is 'Console' (local login) —
+    the WTS API can return stale CLIENTNAME values from a previous RDP
+    session even on a physical console login.
     """
     global _last_wts_identity
     import getpass
@@ -222,19 +232,20 @@ def detect_user() -> Dict[str, str]:
     if explicit:
         return {"os_username": explicit, "identity_source": "explicit"}
 
-    live = _wts_get_current_clientname()
-    if live and live.lower() not in ("", "console"):
-        _last_wts_identity = live
-        return {"os_username": live, "identity_source": "clientname_wts"}
+    # On a console (non-RDP) session, skip CLIENTNAME entirely — WTS can
+    # return stale values from a previous RDP session.
+    if not _is_console_session():
+        live = _wts_get_current_clientname()
+        if live and live.lower() not in ("", "console"):
+            _last_wts_identity = live
+            return {"os_username": live, "identity_source": "clientname_wts"}
 
-    # WTS returned empty (session disconnected). Use the last known WTS
-    # identity — it's the most recent person who was actually attached.
-    if _last_wts_identity:
-        return {"os_username": _last_wts_identity, "identity_source": "clientname_wts_cached"}
+        if _last_wts_identity:
+            return {"os_username": _last_wts_identity, "identity_source": "clientname_wts_cached"}
 
-    clientname = (os.environ.get("CLIENTNAME") or "").strip()
-    if clientname and clientname.lower() != "console":
-        return {"os_username": clientname, "identity_source": "clientname_env"}
+        clientname = (os.environ.get("CLIENTNAME") or "").strip()
+        if clientname and clientname.lower() != "console":
+            return {"os_username": clientname, "identity_source": "clientname_env"}
 
     return {
         "os_username":     (getpass.getuser() or "unknown").strip(),
@@ -249,18 +260,12 @@ def detect_machine(machine_fp: str) -> Dict[str, Any]:
     reason detect_user() does -- the env value is frozen at process spawn
     and doesn't reflect disconnect/reconnect session takeovers.
 
-    is_rdp is true when either:
-      - SESSIONNAME starts with 'RDP-' (Windows tags RDP session names this way), or
-      - CLIENTNAME (live or env) is set to anything other than 'Console'.
+    is_rdp requires SESSIONNAME to start with 'RDP-'. A console session
+    is never flagged as RDP even if CLIENTNAME is set (WTS can return
+    stale values from a prior RDP connection).
     """
-    live_client = _wts_get_current_clientname()
-    env_client  = (os.environ.get("CLIENTNAME") or "").strip()
-    clientname  = (live_client or env_client or "").strip()
-
     sessionname = (os.environ.get("SESSIONNAME") or "").strip()
-    is_rdp = sessionname.startswith("RDP-") or (
-        bool(clientname) and clientname.lower() != "console"
-    )
+    is_rdp = sessionname.startswith("RDP-")
 
     payload: Dict[str, Any] = {
         "hostname":   socket.gethostname(),
@@ -269,7 +274,10 @@ def detect_machine(machine_fp: str) -> Dict[str, Any]:
         "is_rdp":     is_rdp,
     }
     if is_rdp:
-        if clientname:
+        live_client = _wts_get_current_clientname()
+        env_client  = (os.environ.get("CLIENTNAME") or "").strip()
+        clientname  = (live_client or env_client or "").strip()
+        if clientname and clientname.lower() != "console":
             payload["client_machine"] = clientname
         if sessionname:
             payload["session_id"]     = sessionname
