@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.7.5"
+#define MyAppVersion    "1.7.7"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -108,8 +108,11 @@ Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""{#TaskName}"""; \
 ; Start the daemon NOW for the install user so they don't have to log out
 ; and back in to see data flowing. runasoriginaluser drops admin priv.
 ; nowait so the install finishes; the daemon runs forever.
+; skipifsilent: MDM/Intune installs run as SYSTEM — the daemon would start
+; in Session 0 with no access to the user's .claude/ files and block the
+; real user-context instance from launching at logon.
 Filename: "{app}\{#MyAppExeName}"; Parameters: "daemon"; WorkingDir: "{app}"; \
-    Flags: runasoriginaluser nowait; \
+    Flags: runasoriginaluser nowait skipifsilent; \
     StatusMsg: "Starting collector daemon..."
 
 ; Launch the tray icon NOW so the user sees it immediately without having to
