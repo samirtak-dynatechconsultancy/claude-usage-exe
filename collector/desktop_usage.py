@@ -339,7 +339,7 @@ def push_usage(data: Dict, config: Dict):
     }).encode("utf-8")
 
     req = urlrequest.Request(
-        f"{server_url}/api/usage-ingest", data=body, method="POST",
+        f"{server_url}/api/ingest", data=body, method="POST",
         headers={
             "X-Ingest-Token": token,
             "Content-Type": "application/json",
