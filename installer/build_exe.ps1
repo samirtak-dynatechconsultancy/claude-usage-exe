@@ -23,10 +23,11 @@ if (-not $pyiVersion) {
     Write-Host "PyInstaller not found - installing..."
     python -m pip install --upgrade pyinstaller
 }
-# pystray + Pillow are imported by tray.py. PyInstaller can't bundle what
-# isn't installed on the build machine.
-Write-Host "Ensuring pystray + Pillow are installed for tray build..."
-python -m pip install --quiet --upgrade pystray Pillow
+# pystray + Pillow are imported by tray.py; pycryptodome is imported by
+# desktop_usage.py (the `usage` subcommand). PyInstaller can't bundle
+# what isn't installed on the build machine.
+Write-Host "Ensuring pystray + Pillow + pycryptodome are installed..."
+python -m pip install --quiet --upgrade pystray Pillow pycryptodome
 
 # 2. Build.
 #  --onefile          one self-contained .exe
@@ -41,6 +42,8 @@ python -m pip install --quiet --upgrade pystray Pillow
 #  --noconfirm        skip "overwrite?" prompt
 #  --clean            wipe PyInstaller cache for repeatable builds
 #  --name             output filename (drops the .py)
+$desktopUsage = Join-Path $root '..\collector\desktop_usage.py' | Resolve-Path
+
 python -m PyInstaller `
     --onefile `
     --windowed `
@@ -50,6 +53,10 @@ python -m PyInstaller `
     --distpath $distDir `
     --workpath $buildDir `
     --specpath $buildDir `
+    --hidden-import 'desktop_usage' `
+    --hidden-import 'Crypto.Cipher.AES' `
+    --hidden-import 'Crypto.Cipher._mode_gcm' `
+    --add-data "$($desktopUsage);." `
     $collector
 
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed for collector (exit $LASTEXITCODE)" }

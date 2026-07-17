@@ -16,12 +16,17 @@ collector/config.local.json
 installer/build/
 installer/dist/
 installer/*.spec
+desktop_usage/build/
+desktop_usage/dist/
+desktop_usage/*.spec
 
 # Inno Setup output (the .exe ships as a GitHub Release, not in the repo)
 installer/Output/
 
 # ── Secrets ────────────────────────────────────────────────────────────────
 installer/team_token.txt
+desktop_usage/.env
+desktop_usage/usage.csv
 
 # ── Editor / OS ────────────────────────────────────────────────────────────
 .vscode/

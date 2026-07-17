@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.7.6"
+USER_AGENT = "claude-usage-collector/1.8.0"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -1204,6 +1204,38 @@ def cmd_reset(args):
         print("No state to remove.")
 
 
+def cmd_usage(args):
+    """Read Claude Desktop subscription usage (5h/7d %)."""
+    from desktop_usage import (
+        get_session_cookie, read_usage, print_usage,
+        append_csv, push_usage, install_task, uninstall_task,
+    )
+
+    if args.install_task is not None:
+        exe = sys.executable
+        install_task(exe, args.install_task)
+        return
+
+    if args.uninstall_task:
+        uninstall_task()
+        return
+
+    cookie = get_session_cookie()
+    data = read_usage(cookie)
+    print_usage(data)
+
+    base = str(_exe_dir())
+
+    if args.log:
+        csv_path = os.path.join(base, "usage.csv")
+        append_csv(data, csv_path)
+        print(f"  CSV: appended to {csv_path}")
+
+    if not args.no_push:
+        cfg = _load_config(args.config) if hasattr(args, "config") else {}
+        push_usage(data, cfg)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="collector", description="Claude Code usage collector")
     parser.add_argument("--config", help="Path to config.json (overrides search)")
@@ -1223,6 +1255,19 @@ def main(argv=None):
 
     p_reset = sub.add_parser("reset-state", help="Forget all push history (next push re-processes everything)")
     p_reset.set_defaults(func=cmd_reset)
+
+    p_usage = sub.add_parser("usage",
+                             help="Read Claude Desktop subscription usage (5h/7d %%)")
+    p_usage.add_argument("--log", action="store_true",
+                         help="Also append to usage.csv")
+    p_usage.add_argument("--no-push", action="store_true",
+                         help="Skip Supabase push")
+    p_usage.add_argument("--install-task", metavar="HH:MM", nargs="?",
+                         const="18:00",
+                         help="Register a daily scheduled task (default 18:00)")
+    p_usage.add_argument("--uninstall-task", action="store_true",
+                         help="Remove the daily usage task")
+    p_usage.set_defaults(func=cmd_usage)
 
     args = parser.parse_args(argv)
     try:
