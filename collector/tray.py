@@ -199,6 +199,21 @@ def on_push_now(icon, item):
         pass
 
 
+def on_check_usage(icon, item):
+    exe = collector_path()
+    if not exe.exists():
+        return
+    try:
+        subprocess.Popen(
+            [str(exe), "usage"],
+            cwd=str(install_dir()),
+            creationflags=CREATE_NO_WINDOW,
+            close_fds=True,
+        )
+    except Exception:
+        pass
+
+
 def on_open_install_dir(icon, item):
     _open(install_dir())
 
@@ -620,6 +635,7 @@ def _build_menu() -> pystray.Menu:
     items = [
         pystray.MenuItem("View log",            on_view_log,         default=True),
         pystray.MenuItem("Run push now",        on_push_now),
+        pystray.MenuItem("Check usage now",     on_check_usage),
         pystray.MenuItem("Open install folder", on_open_install_dir),
         pystray.MenuItem("Edit config",         on_edit_config),
     ]
