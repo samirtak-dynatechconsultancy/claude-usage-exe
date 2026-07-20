@@ -20,6 +20,7 @@ import platform
 import re
 import shutil
 import sqlite3
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -190,7 +191,11 @@ def get_session_cookie() -> str:
     key = _get_encryption_key()
     db_copy = _copy_cookie_db()
     try:
-        conn = sqlite3.connect(f"{db_copy}?immutable=1", uri=True)
+        # Build a proper file: URI so ?immutable=1 is honoured. A raw Windows
+        # path with uri=True makes SQLite treat "...db?immutable=1" as a literal
+        # filename -> "unable to open database file".
+        db_uri = Path(db_copy).as_uri() + "?immutable=1"
+        conn = sqlite3.connect(db_uri, uri=True)
         row = conn.execute(
             "SELECT encrypted_value FROM cookies "
             "WHERE host_key LIKE '%claude.ai%' AND name = 'sessionKey'"
