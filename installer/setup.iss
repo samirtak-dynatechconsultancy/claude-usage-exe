@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.8.5"
+#define MyAppVersion    "1.8.6"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -61,6 +61,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Files]
 Source: "dist\ClaudeUsageCollector.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\ClaudeUsageTray.exe";      DestDir: "{app}"; Flags: ignoreversion
+Source: "run_usage.vbs";                 DestDir: "{app}"; Flags: ignoreversion
 Source: "..\collector\config.example.json"; DestDir: "{app}"; DestName: "config.example.json"; Flags: ignoreversion
 ; CONSENT.txt is the last file -- its AfterInstall procedure writes
 ; config.json. That guarantees config.json exists before [Run] fires the
@@ -134,8 +135,9 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "{code:GetUsageParams}"; \
     Flags: runhidden skipifsilent; \
     StatusMsg: "Scheduling Claude Desktop usage upload..."
 
-; Push once now so the dashboard shows data immediately (also elevated).
-Filename: "{app}\{#MyAppExeName}"; Parameters: "usage"; \
+; Push once now so the dashboard shows data immediately (elevated, hidden via
+; the wscript launcher so no console flashes).
+Filename: "{sys}\wscript.exe"; Parameters: """{app}\run_usage.vbs"""; \
     Flags: runhidden nowait skipifsilent; \
     StatusMsg: "Uploading current Claude Desktop usage..."
 

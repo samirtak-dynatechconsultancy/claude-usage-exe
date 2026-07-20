@@ -397,8 +397,17 @@ def install_task(exe_path: str, every: int = 1, unit: str = "days",
     trigger_line, wake = _usage_trigger(every, unit, at_time)
     wake_line = "    -WakeToRun `\n" if wake else ""
 
+    # Run through the hidden VBS launcher (via wscript) so no console window
+    # pops up on each collection. Fall back to the exe directly if the VBS
+    # isn't alongside it (e.g. running from source).
+    vbs = os.path.join(os.path.dirname(exe_path), "run_usage.vbs")
+    if os.path.exists(vbs):
+        act_exec, act_arg = "wscript.exe", f'"{vbs}"'
+    else:
+        act_exec, act_arg = f'"{exe_path}"', "usage"
+
     ps = f"""
-$action   = New-ScheduledTaskAction -Execute '"{exe_path}"' -Argument 'usage'
+$action   = New-ScheduledTaskAction -Execute '{act_exec}' -Argument '{act_arg}'
 {trigger_line}
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
