@@ -359,14 +359,45 @@ def push_usage(data: Dict, config: Dict):
 # Task Scheduler
 # ---------------------------------------------------------------------------
 
-def install_task(exe_path: str, time_str: str = "18:00"):
+def _usage_trigger(every: int, unit: str, at_time: str) -> Tuple[str, bool]:
+    """Return (PowerShell '$trigger = ...' assignment, wake_from_sleep).
+
+    minutes/hours -> repeat from now indefinitely (no wake, so a short cadence
+    doesn't keep waking the PC). days/weeks -> fire at a time of day, wake +
+    catch-up. weeks == days*7.
+    """
+    u = (unit or "days").lower().rstrip("s")
+    if u in ("minute", "min", "m"):
+        return (f"$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) "
+                f"-RepetitionInterval (New-TimeSpan -Minutes {every}) "
+                f"-RepetitionDuration (New-TimeSpan -Days 9999)"), False
+    if u in ("hour", "hr", "h"):
+        return (f"$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) "
+                f"-RepetitionInterval (New-TimeSpan -Hours {every}) "
+                f"-RepetitionDuration (New-TimeSpan -Days 9999)"), False
+    if u in ("week", "wk", "w"):
+        return (f"$trigger = New-ScheduledTaskTrigger -Daily "
+                f"-DaysInterval {every * 7} -At '{at_time}'"), True
+    return (f"$trigger = New-ScheduledTaskTrigger -Daily "
+            f"-DaysInterval {every} -At '{at_time}'"), True
+
+
+def install_task(exe_path: str, every: int = 1, unit: str = "days",
+                 at_time: str = "18:00"):
+    try:
+        every = max(1, int(every))
+    except (TypeError, ValueError):
+        every = 1
+
+    trigger_line, wake = _usage_trigger(every, unit, at_time)
+    wake_line = "    -WakeToRun `\n" if wake else ""
+
     ps = f"""
 $action   = New-ScheduledTaskAction -Execute '"{exe_path}"' -Argument 'usage'
-$trigger  = New-ScheduledTaskTrigger -Daily -At '{time_str}'
+{trigger_line}
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
-    -WakeToRun `
-    -AllowStartIfOnBatteries `
+{wake_line}    -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Hours 1)
 $principal = New-ScheduledTaskPrincipal `
@@ -384,7 +415,7 @@ Register-ScheduledTask `
     r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                        capture_output=True, text=True)
     if r.returncode == 0:
-        print(f"Task '{USAGE_TASK_NAME}' registered: daily at {time_str} "
+        print(f"Task '{USAGE_TASK_NAME}' registered: every {every} {unit} "
               "(elevated, catch-up enabled)")
     else:
         print(f"Failed to register task:\n{r.stderr.strip()}")

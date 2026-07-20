@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.8.2"
+#define MyAppVersion    "1.8.3"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -130,9 +130,9 @@ Filename: "{app}\{#MyTrayExeName}"; \
 ; can't elevate, so usage stays empty for them (see RELEASE_NOTES_v1_8_2).
 ; skipifsilent: SYSTEM/Intune installs would register the task as SYSTEM, which
 ; can't decrypt the per-user cookie, so we skip it in that path.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "usage --install-task 18:00"; \
+Filename: "{app}\{#MyAppExeName}"; Parameters: "{code:GetUsageParams}"; \
     Flags: runhidden skipifsilent; \
-    StatusMsg: "Scheduling daily Claude Desktop usage upload..."
+    StatusMsg: "Scheduling Claude Desktop usage upload..."
 
 ; Push once now so the dashboard shows data immediately (also elevated).
 Filename: "{app}\{#MyAppExeName}"; Parameters: "usage"; \
@@ -170,6 +170,8 @@ var
   ConfigPage:  TInputQueryWizardPage;
   ConsentPage: TOutputMsgMemoWizardPage;
   PrivacyPage: TInputOptionWizardPage;
+  IntervalUnitPage:   TInputOptionWizardPage;
+  IntervalDetailPage: TInputQueryWizardPage;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
@@ -265,6 +267,29 @@ begin
   ConfigPage.Values[1] := GetCmdLineParam('TOKEN');
   if ConfigPage.Values[1] = '' then
     ConfigPage.Values[1] := '{#DefaultIngestToken}';
+
+  { v1.8.3: how often to collect Claude Desktop usage -- unit then number. }
+  IntervalUnitPage := CreateInputOptionPage(
+    ConfigPage.ID,
+    'Usage Collection Schedule',
+    'How often should Claude Desktop usage be uploaded?',
+    'Pick a time unit here; set the number on the next page. It repeats on this interval.',
+    True, False);
+  IntervalUnitPage.Add('Minutes');
+  IntervalUnitPage.Add('Hours');
+  IntervalUnitPage.Add('Days');
+  IntervalUnitPage.Add('Weeks');
+  IntervalUnitPage.SelectedValueIndex := 2;   { Days by default }
+
+  IntervalDetailPage := CreateInputQueryPage(
+    IntervalUnitPage.ID,
+    'Usage Collection Schedule',
+    'Set the interval',
+    'Runs again and again on this interval. The time of day applies only to Days/Weeks.');
+  IntervalDetailPage.Add('Run every how many (a whole number):', False);
+  IntervalDetailPage.Add('Time of day HH:MM (Days/Weeks only):', False);
+  IntervalDetailPage.Values[0] := '1';
+  IntervalDetailPage.Values[1] := '18:00';
 end;
 
 procedure WriteConfigJson;
@@ -307,22 +332,61 @@ begin
   SaveStringToFile(configPath, contents, False);
 end;
 
+{ Build the collector argument string for the usage-task registration, from
+  the schedule pages. Called by the Run entry via a code: constant. }
+function GetUsageParams(Param: String): String;
+var
+  unitStr, num, atTime: String;
+begin
+  if IntervalUnitPage = nil then
+  begin
+    Result := 'usage --install-task --every 1 --unit days --at 18:00';
+    Exit;
+  end;
+  case IntervalUnitPage.SelectedValueIndex of
+    0: unitStr := 'minutes';
+    1: unitStr := 'hours';
+    3: unitStr := 'weeks';
+  else
+    unitStr := 'days';
+  end;
+  num := Trim(IntervalDetailPage.Values[0]);
+  if num = '' then num := '1';
+  atTime := Trim(IntervalDetailPage.Values[1]);
+  if atTime = '' then atTime := '18:00';
+  Result := 'usage --install-task --every ' + num +
+            ' --unit ' + unitStr + ' --at ' + atTime;
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   url: String;
+  n: Integer;
 begin
   Result := True;
-  if CurPageID <> ConfigPage.ID then Exit;
 
-  url := Trim(ConfigPage.Values[0]);
-  if (Pos('http://', LowerCase(url)) <> 1) and (Pos('https://', LowerCase(url)) <> 1) then
+  if CurPageID = ConfigPage.ID then
   begin
-    MsgBox('Server URL must start with http:// or https://', mbError, MB_OK);
-    Result := False; Exit;
+    url := Trim(ConfigPage.Values[0]);
+    if (Pos('http://', LowerCase(url)) <> 1) and (Pos('https://', LowerCase(url)) <> 1) then
+    begin
+      MsgBox('Server URL must start with http:// or https://', mbError, MB_OK);
+      Result := False; Exit;
+    end;
+    if Trim(ConfigPage.Values[1]) = '' then
+    begin
+      MsgBox('Ingest token is required.', mbError, MB_OK);
+      Result := False; Exit;
+    end;
   end;
-  if Trim(ConfigPage.Values[1]) = '' then
+
+  if (IntervalDetailPage <> nil) and (CurPageID = IntervalDetailPage.ID) then
   begin
-    MsgBox('Ingest token is required.', mbError, MB_OK);
-    Result := False; Exit;
+    n := StrToIntDef(Trim(IntervalDetailPage.Values[0]), -1);
+    if n < 1 then
+    begin
+      MsgBox('Enter a whole number of 1 or more for the interval.', mbError, MB_OK);
+      Result := False; Exit;
+    end;
   end;
 end;

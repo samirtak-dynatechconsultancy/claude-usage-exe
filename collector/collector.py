@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.8.2"
+USER_AGENT = "claude-usage-collector/1.8.3"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -1213,7 +1213,12 @@ def cmd_usage(args):
 
     if args.install_task is not None:
         exe = sys.executable
-        install_task(exe, args.install_task)
+        tv = args.install_task
+        if tv != "__flag__" and ":" in tv:
+            # Back-compat: `usage --install-task 09:00` == daily at that time.
+            install_task(exe, every=1, unit="days", at_time=tv)
+        else:
+            install_task(exe, every=args.every, unit=args.unit, at_time=args.at)
         return
 
     if args.uninstall_task:
@@ -1263,10 +1268,17 @@ def main(argv=None):
     p_usage.add_argument("--no-push", action="store_true",
                          help="Skip Supabase push")
     p_usage.add_argument("--install-task", metavar="HH:MM", nargs="?",
-                         const="18:00",
-                         help="Register a daily scheduled task (default 18:00)")
+                         const="__flag__",
+                         help="Register the recurring usage task "
+                              "(use --every/--unit, or pass HH:MM for daily)")
+    p_usage.add_argument("--every", type=int, default=1,
+                         help="Interval count for --install-task (default 1)")
+    p_usage.add_argument("--unit", default="days",
+                         help="Interval unit: minutes|hours|days|weeks")
+    p_usage.add_argument("--at", default="18:00", metavar="HH:MM",
+                         help="Time of day for days/weeks (default 18:00)")
     p_usage.add_argument("--uninstall-task", action="store_true",
-                         help="Remove the daily usage task")
+                         help="Remove the usage task")
     p_usage.set_defaults(func=cmd_usage)
 
     args = parser.parse_args(argv)
