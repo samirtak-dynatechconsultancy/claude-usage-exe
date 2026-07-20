@@ -158,6 +158,10 @@ def _decrypt_cookie(encrypted_value: bytes, key: bytes) -> str:
 # Set False to never auto-close Claude (rely on closed-app or admin/VSS only).
 ALLOW_CLOSE_CLAUDE = True
 
+# CREATE_NO_WINDOW: keep background subprocess calls (powershell, taskkill,
+# esentutl, schtasks) from flashing a console window.
+_NO_WINDOW = 0x08000000
+
 
 def _running_claude_path():
     """Path of a running claude.exe (to relaunch later), or None if not running."""
@@ -166,7 +170,8 @@ def _running_claude_path():
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process -Filter \"name='claude.exe'\" "
              "| Select-Object -First 1 -ExpandProperty ExecutablePath"],
-            capture_output=True, text=True, timeout=15).stdout.strip()
+            capture_output=True, text=True, timeout=15,
+            creationflags=_NO_WINDOW).stdout.strip()
         return out or None
     except Exception:
         return None
@@ -193,7 +198,8 @@ def _confirm_restart() -> bool:
 
 
 def _close_claude():
-    subprocess.run(["taskkill", "/F", "/IM", "claude.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "claude.exe"],
+                   capture_output=True, creationflags=_NO_WINDOW)
     time.sleep(2)   # let Windows release the cookie DB handle before we copy
 
 
@@ -232,7 +238,7 @@ def _copy_cookie_db():
     try:
         r = subprocess.run(
             ["esentutl.exe", "/y", "/vss", COOKIE_DB_PATH, "/d", tmp],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=30, creationflags=_NO_WINDOW,
         )
         if r.returncode == 0 and os.path.exists(tmp):
             return tmp, None
@@ -519,7 +525,7 @@ Register-ScheduledTask `
     -Force
 """
     r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, creationflags=_NO_WINDOW)
     if r.returncode == 0:
         who = "logged-on user (fleet)" if fleet else "current user"
         print(f"Task '{USAGE_TASK_NAME}' registered: every {every} {unit}, "
@@ -532,7 +538,7 @@ Register-ScheduledTask `
 def uninstall_task():
     r = subprocess.run(
         ["schtasks", "/Delete", "/F", "/TN", USAGE_TASK_NAME],
-        capture_output=True, text=True)
+        capture_output=True, text=True, creationflags=_NO_WINDOW)
     if r.returncode == 0:
         print(f"Task '{USAGE_TASK_NAME}' removed.")
     else:
