@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.8.7"
+USER_AGENT = "claude-usage-collector/1.8.8"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -1214,18 +1214,26 @@ def cmd_usage(args):
     if args.install_task is not None:
         exe = sys.executable
         tv = args.install_task
+        fleet = getattr(args, "fleet", False)
         if tv != "__flag__" and ":" in tv:
             # Back-compat: `usage --install-task 09:00` == daily at that time.
-            install_task(exe, every=1, unit="days", at_time=tv)
+            install_task(exe, every=1, unit="days", at_time=tv, fleet=fleet)
         else:
-            install_task(exe, every=args.every, unit=args.unit, at_time=args.at)
+            install_task(exe, every=args.every, unit=args.unit,
+                         at_time=args.at, fleet=fleet)
         return
 
     if args.uninstall_task:
         uninstall_task()
         return
 
-    cookie = get_session_cookie()
+    try:
+        cookie = get_session_cookie()
+    except PermissionError as e:
+        # Cookie locked and user declined the restart (or no admin/UI). Not an
+        # error -- just skip quietly and try again on the next scheduled run.
+        print(f"usage: skipped - {e}")
+        return
     data = read_usage(cookie)
     print_usage(data)
 
@@ -1280,6 +1288,9 @@ def main(argv=None):
                          help="Interval unit: minutes|hours|days|weeks")
     p_usage.add_argument("--at", default="18:00", metavar="HH:MM",
                          help="Time of day for days/weeks (default 18:00)")
+    p_usage.add_argument("--fleet", action="store_true",
+                         help="Register the task for the logged-on user "
+                              "(BUILTIN\\Users) - for silent/Intune installs")
     p_usage.add_argument("--uninstall-task", action="store_true",
                          help="Remove the usage task")
     p_usage.set_defaults(func=cmd_usage)

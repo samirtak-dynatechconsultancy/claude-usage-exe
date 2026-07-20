@@ -26,6 +26,14 @@ By installing this software on this machine, you understand and agree:
    Dashboard access is restricted to an allowlisted group of email
    addresses.
 
+4b. CLAUDE DESKTOP SUBSCRIPTION USAGE
+   Once a day this also records your Claude Desktop usage percentages
+   (the 5-hour and 7-day limit numbers) - just those numbers, never your
+   conversations and never your login token. To read them it may need to
+   BRIEFLY CLOSE AND REOPEN Claude Desktop. It will ALWAYS ASK YOU FIRST
+   with a Yes/No popup; click No and it skips and tries again later.
+   Save any message you're typing before clicking Yes.
+
 5. WHAT YOU SHOULD NOT PASTE INTO CLAUDE CODE ON THIS MACHINE
    If you chose "full conversation content" on the next screen:
    - API keys, passwords, tokens, or other secrets

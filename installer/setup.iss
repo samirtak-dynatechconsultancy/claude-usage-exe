@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.8.7"
+#define MyAppVersion    "1.8.8"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -131,8 +131,10 @@ Filename: "{app}\{#MyTrayExeName}"; \
 ; can't elevate, so usage stays empty for them (see RELEASE_NOTES_v1_8_2).
 ; skipifsilent: SYSTEM/Intune installs would register the task as SYSTEM, which
 ; can't decrypt the per-user cookie, so we skip it in that path.
+; No skipifsilent: silent/Intune installs must register the task too (it runs
+; as BUILTIN\Users -> the logged-on user, via --fleet). SYSTEM can register it.
 Filename: "{app}\{#MyAppExeName}"; Parameters: "{code:GetUsageParams}"; \
-    Flags: runhidden skipifsilent; \
+    Flags: runhidden; \
     StatusMsg: "Scheduling Claude Desktop usage upload..."
 
 ; Push once now so the dashboard shows data immediately (elevated, hidden via
@@ -342,7 +344,7 @@ var
 begin
   if IntervalUnitPage = nil then
   begin
-    Result := 'usage --install-task --every 1 --unit days --at 18:00';
+    Result := 'usage --install-task --every 1 --unit days --at 18:00 --fleet';
     Exit;
   end;
   case IntervalUnitPage.SelectedValueIndex of
@@ -357,7 +359,7 @@ begin
   atTime := Trim(IntervalDetailPage.Values[1]);
   if atTime = '' then atTime := '18:00';
   Result := 'usage --install-task --every ' + num +
-            ' --unit ' + unitStr + ' --at ' + atTime;
+            ' --unit ' + unitStr + ' --at ' + atTime + ' --fleet';
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;

@@ -172,6 +172,26 @@ def _running_claude_path():
         return None
 
 
+def _confirm_restart() -> bool:
+    """Ask the user before closing Claude. Returns True only if they click Yes.
+    Shown on the interactive desktop; if no UI is available (e.g. session 0) or
+    they decline/close it, returns False so we skip rather than disrupt them."""
+    try:
+        MB_YESNO, MB_ICONQUESTION = 0x4, 0x20
+        MB_SYSTEMMODAL, MB_SETFOREGROUND = 0x1000, 0x10000
+        IDYES = 6
+        r = ctypes.windll.user32.MessageBoxW(
+            0,
+            "To record your Claude usage, the collector needs to briefly close "
+            "and reopen Claude Desktop.\n\n"
+            "Save anything you're typing first. Close and reopen Claude now?",
+            "Claude Usage Collector",
+            MB_YESNO | MB_ICONQUESTION | MB_SYSTEMMODAL | MB_SETFOREGROUND)
+        return r == IDYES
+    except Exception:
+        return False
+
+
 def _close_claude():
     subprocess.run(["taskkill", "/F", "/IM", "claude.exe"], capture_output=True)
     time.sleep(2)   # let Windows release the cookie DB handle before we copy
@@ -219,10 +239,14 @@ def _copy_cookie_db():
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # 3. No admin: briefly close Claude so the file unlocks, then relaunch it.
+    # 3. No admin: ASK the user, then briefly close Claude so the file unlocks,
+    #    then relaunch it. We never close Claude without an explicit "Yes".
     if ALLOW_CLOSE_CLAUDE:
         claude_path = _running_claude_path()
         if claude_path:
+            if not _confirm_restart():
+                raise PermissionError(
+                    "User declined the Claude restart -- skipping this run.")
             _close_claude()
             try:
                 shutil.copy2(COOKIE_DB_PATH, tmp)
@@ -440,7 +464,16 @@ def _usage_trigger(every: int, unit: str, at_time: str) -> Tuple[str, bool]:
 
 
 def install_task(exe_path: str, every: int = 1, unit: str = "days",
-                 at_time: str = "18:00"):
+                 at_time: str = "18:00", fleet: bool = False):
+    """Register the recurring usage task.
+
+    fleet=False -> runs as the current interactive user (attended install).
+    fleet=True  -> runs as BUILTIN\\Users (whoever is logged on) so a silent
+                   SYSTEM/Intune install produces a task in the user's context.
+                   The read needs no admin: when the cookie DB is locked it ASKS
+                   the user (a Yes/No popup) before briefly closing/reopening
+                   Claude, so nothing happens without their consent.
+    """
     try:
         every = max(1, int(every))
     except (TypeError, ValueError):
@@ -458,6 +491,16 @@ def install_task(exe_path: str, every: int = 1, unit: str = "days",
     else:
         act_exec, act_arg = f'"{exe_path}"', "usage"
 
+    if fleet:
+        principal_line = ("$principal = New-ScheduledTaskPrincipal `\n"
+                          "    -GroupId 'BUILTIN\\Users' `\n"
+                          "    -RunLevel Highest")
+    else:
+        principal_line = ("$principal = New-ScheduledTaskPrincipal `\n"
+                          '    -UserId "$env:USERDOMAIN\\$env:USERNAME" `\n'
+                          "    -LogonType Interactive `\n"
+                          "    -RunLevel Highest")
+
     ps = f"""
 $action   = New-ScheduledTaskAction -Execute '{act_exec}' -Argument '{act_arg}'
 {trigger_line}
@@ -466,10 +509,7 @@ $settings = New-ScheduledTaskSettingsSet `
 {wake_line}    -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Hours 1)
-$principal = New-ScheduledTaskPrincipal `
-    -UserId "$env:USERDOMAIN\\$env:USERNAME" `
-    -LogonType Interactive `
-    -RunLevel Highest
+{principal_line}
 Register-ScheduledTask `
     -TaskName '{USAGE_TASK_NAME}' `
     -Action $action `
@@ -481,8 +521,9 @@ Register-ScheduledTask `
     r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                        capture_output=True, text=True)
     if r.returncode == 0:
-        print(f"Task '{USAGE_TASK_NAME}' registered: every {every} {unit} "
-              "(elevated, catch-up enabled)")
+        who = "logged-on user (fleet)" if fleet else "current user"
+        print(f"Task '{USAGE_TASK_NAME}' registered: every {every} {unit}, "
+              f"{who}, catch-up enabled")
     else:
         print(f"Failed to register task:\n{r.stderr.strip()}")
         sys.exit(1)
