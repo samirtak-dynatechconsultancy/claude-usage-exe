@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.8.1"
+#define MyAppVersion    "1.8.2"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -122,6 +122,23 @@ Filename: "{app}\{#MyTrayExeName}"; \
     Flags: runasoriginaluser nowait skipifsilent; \
     StatusMsg: "Starting tray icon..."
 
+; v1.8.2: schedule the daily Claude Desktop usage upload. This runs in the
+; ELEVATED installer context (deliberately NOT runasoriginaluser) so it has the
+; rights to register a RunLevel-Highest task. That task then runs elevated as
+; the install user, so VSS can read the cookie even while Claude Desktop is open.
+; NOTE: this only works for users who are LOCAL ADMINS -- a standard user's task
+; can't elevate, so usage stays empty for them (see RELEASE_NOTES_v1_8_2).
+; skipifsilent: SYSTEM/Intune installs would register the task as SYSTEM, which
+; can't decrypt the per-user cookie, so we skip it in that path.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "usage --install-task 18:00"; \
+    Flags: runhidden skipifsilent; \
+    StatusMsg: "Scheduling daily Claude Desktop usage upload..."
+
+; Push once now so the dashboard shows data immediately (also elevated).
+Filename: "{app}\{#MyAppExeName}"; Parameters: "usage"; \
+    Flags: runhidden nowait skipifsilent; \
+    StatusMsg: "Uploading current Claude Desktop usage..."
+
 [UninstallRun]
 ; Kill the running daemon + tray processes so Inno Setup can delete their
 ; .exes without "in use" errors. /F = force, /IM = match by image name.
@@ -134,6 +151,10 @@ Filename: "taskkill.exe"; Parameters: "/F /IM ""{#MyTrayExeName}"""; \
 ; installs. /F = no confirmation. Silently no-ops if absent.
 Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""{#TaskName}"""; \
     Flags: runhidden; RunOnceId: "removeLegacySchedTask"
+
+; v1.8.2: remove the daily Claude Desktop usage task.
+Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""ClaudeUsageDaily"""; \
+    Flags: runhidden; RunOnceId: "removeUsageTask"
 
 [UninstallDelete]
 ; The exe stops writing here at uninstall, but state.json / collector.log
