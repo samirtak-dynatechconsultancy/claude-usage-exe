@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.8.4"
+USER_AGENT = "claude-usage-collector/1.8.5"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -1237,7 +1237,10 @@ def cmd_usage(args):
         print(f"  CSV: appended to {csv_path}")
 
     if not args.no_push:
-        cfg = _load_config(args.config) if hasattr(args, "config") else {}
+        try:
+            cfg, _ = load_config(getattr(args, "config", None))
+        except FileNotFoundError:
+            cfg = {}   # push_usage skips cleanly when server_url/token absent
         push_usage(data, cfg)
 
 
