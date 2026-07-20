@@ -24,6 +24,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 from urllib import request as urlrequest
@@ -154,7 +155,45 @@ def _decrypt_cookie(encrypted_value: bytes, key: bytes) -> str:
 # Cookie retrieval (with VSS fallback for locked DB)
 # ---------------------------------------------------------------------------
 
-def _copy_cookie_db() -> str:
+# Set False to never auto-close Claude (rely on closed-app or admin/VSS only).
+ALLOW_CLOSE_CLAUDE = True
+
+
+def _running_claude_path():
+    """Path of a running claude.exe (to relaunch later), or None if not running."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"name='claude.exe'\" "
+             "| Select-Object -First 1 -ExpandProperty ExecutablePath"],
+            capture_output=True, text=True, timeout=15).stdout.strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _close_claude():
+    subprocess.run(["taskkill", "/F", "/IM", "claude.exe"], capture_output=True)
+    time.sleep(2)   # let Windows release the cookie DB handle before we copy
+
+
+def _start_claude(path):
+    if path and os.path.exists(path):
+        try:
+            subprocess.Popen([path])
+        except Exception:
+            pass
+
+
+def _copy_cookie_db():
+    """Copy the cookie DB. Returns (tmp_path, claude_restart_path).
+
+    claude_restart_path is set ONLY when we had to close Claude to read the DB;
+    the caller must relaunch it. Order minimises disruption:
+      1. direct copy   -> Claude already closed (no admin, no disruption)
+      2. VSS snapshot  -> Claude open + admin  (no disruption)
+      3. close/reopen  -> Claude open, no admin (brief force-quit of Claude)
+    """
     if not os.path.exists(COOKIE_DB_PATH):
         raise FileNotFoundError(
             f"Cookie DB not found at {COOKIE_DB_PATH}\n"
@@ -162,34 +201,44 @@ def _copy_cookie_db() -> str:
 
     tmp = tempfile.mktemp(suffix=".db")
 
-    # Try direct copy (works when Claude Desktop is fully closed).
+    # 1. Direct copy (Claude fully closed).
     try:
         shutil.copy2(COOKIE_DB_PATH, tmp)
-        return tmp
+        return tmp, None
     except (PermissionError, OSError):
         pass
 
-    # VSS snapshot fallback (needs admin).
+    # 2. VSS snapshot (needs admin) -- preferred when elevated, no disruption.
     try:
         r = subprocess.run(
             ["esentutl.exe", "/y", "/vss", COOKIE_DB_PATH, "/d", tmp],
             capture_output=True, timeout=30,
         )
         if r.returncode == 0 and os.path.exists(tmp):
-            return tmp
+            return tmp, None
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
+    # 3. No admin: briefly close Claude so the file unlocks, then relaunch it.
+    if ALLOW_CLOSE_CLAUDE:
+        claude_path = _running_claude_path()
+        if claude_path:
+            _close_claude()
+            try:
+                shutil.copy2(COOKIE_DB_PATH, tmp)
+                return tmp, claude_path
+            except (PermissionError, OSError):
+                _start_claude(claude_path)   # restore even if the copy failed
+
     raise PermissionError(
-        "Cannot read cookie DB -- Claude Desktop has it locked.\n"
-        "Either quit Claude Desktop fully (right-click tray icon > Quit),\n"
-        "or run this tool as Administrator for VSS snapshot access.")
+        "Cannot read cookie DB -- Claude Desktop has it locked and it could "
+        "not be copied. Quit Claude fully, or run as Administrator.")
 
 
 def get_session_cookie() -> str:
     """Extract and decrypt the sessionKey cookie from Claude Desktop."""
     key = _get_encryption_key()
-    db_copy = _copy_cookie_db()
+    db_copy, restart_path = _copy_cookie_db()
     try:
         # Build a proper file: URI so ?immutable=1 is honoured. A raw Windows
         # path with uri=True makes SQLite treat "...db?immutable=1" as a literal
@@ -209,6 +258,9 @@ def get_session_cookie() -> str:
 
         return _decrypt_cookie(row[0], key)
     finally:
+        # Relaunch Claude if we closed it, then clean up the temp copy.
+        if restart_path:
+            _start_claude(restart_path)
         try:
             os.unlink(db_copy)
         except OSError:
