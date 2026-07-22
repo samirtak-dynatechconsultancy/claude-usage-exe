@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.8.10"
+#define MyAppVersion    "1.9.0"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -62,6 +62,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "dist\ClaudeUsageCollector.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\ClaudeUsageTray.exe";      DestDir: "{app}"; Flags: ignoreversion
 Source: "run_usage.vbs";                 DestDir: "{app}"; Flags: ignoreversion
+Source: "run_team_activity.vbs";         DestDir: "{app}"; Flags: ignoreversion
 Source: "..\collector\config.example.json"; DestDir: "{app}"; DestName: "config.example.json"; Flags: ignoreversion
 ; CONSENT.txt is the last file -- its AfterInstall procedure writes
 ; config.json. That guarantees config.json exists before [Run] fires the
@@ -93,6 +94,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 Name: "{group}\Open log";              Filename: "notepad.exe"; Parameters: """{localappdata}\ClaudeUsageCollector\collector.log"""
 Name: "{group}\Run push now";          Filename: "{app}\{#MyAppExeName}"; Parameters: "push"; WorkingDir: "{app}"
 Name: "{group}\Show collector status"; Filename: "{app}\{#MyAppExeName}"; Parameters: "status"; WorkingDir: "{app}"
+Name: "{group}\Run team activity now"; Filename: "{app}\{#MyAppExeName}"; Parameters: "team-activity"; WorkingDir: "{app}"
 Name: "{group}\Open install folder";   Filename: "{app}"
 Name: "{group}\Edit config";           Filename: "notepad.exe"; Parameters: """{app}\config.json"""
 Name: "{group}\Launch tray icon";      Filename: "{app}\{#MyTrayExeName}"
@@ -143,6 +145,17 @@ Filename: "{sys}\wscript.exe"; Parameters: """{app}\run_usage.vbs"""; \
     Flags: runhidden nowait skipifsilent; \
     StatusMsg: "Uploading current Claude Desktop usage..."
 
+; Schedule the DAILY Team Activity collection (claude.ai per-user admin
+; analytics). Registers as BUILTIN\Users (--fleet) so it works for both
+; attended and silent/Intune installs. The task no-ops until the admin adds
+; org+cookie pairs to config.json (analytics_orgs), so registering it now is
+; harmless. Default 08:00 daily; change with --every/--unit/--at or re-run
+; `ClaudeUsageCollector.exe team-activity --install-task --at HH:MM`.
+Filename: "{app}\{#MyAppExeName}"; \
+    Parameters: "team-activity --install-task --every 1 --unit days --at 08:00 --fleet"; \
+    Flags: runhidden; \
+    StatusMsg: "Scheduling daily Team Activity collection..."
+
 [UninstallRun]
 ; Kill the running daemon + tray processes so Inno Setup can delete their
 ; .exes without "in use" errors. /F = force, /IM = match by image name.
@@ -159,6 +172,10 @@ Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""{#TaskName}"""; \
 ; v1.8.2: remove the daily Claude Desktop usage task.
 Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""ClaudeUsageDaily"""; \
     Flags: runhidden; RunOnceId: "removeUsageTask"
+
+; Remove the daily Team Activity task.
+Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""ClaudeTeamActivityDaily"""; \
+    Flags: runhidden; RunOnceId: "removeTeamActivityTask"
 
 [UninstallDelete]
 ; The exe stops writing here at uninstall, but state.json / collector.log
@@ -336,7 +353,8 @@ begin
     '  "server_url":     "' + serverUrl + '",' + #13#10 +
     '  "ingest_token":   "' + ingestTok + '",' + #13#10 +
     '  "upload_content": ' + uploadContentStr + ',' + #13#10 +
-    '  "projects_dirs":  null' + #13#10 +
+    '  "projects_dirs":  null,' + #13#10 +
+    '  "analytics_orgs": []' + #13#10 +
     '}' + #13#10;
   SaveStringToFile(configPath, contents, False);
 end;

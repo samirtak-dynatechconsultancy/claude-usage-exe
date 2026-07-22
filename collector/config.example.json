@@ -10,5 +10,15 @@
 
   "_comment_3": "projects_dirs overrides where to look for Claude Code JSONL files. null = defaults (~/.claude/projects and the Xcode coding-assistant dir).",
 
-  "projects_dirs": null
+  "projects_dirs": null,
+
+  "_comment_4": "analytics_orgs powers the dashboard's Team Activity tab. The `team-activity` command runs DAILY on THIS machine (where a valid claude.ai Cookie lives), fetches claude.ai's per-user admin analytics for each org below, and pushes it to the dashboard DB. Add one entry per organization you admin. `org` is the organization UUID (from the /organizations/<UUID>/... URL). `cookie` is the FULL Cookie header copied from a logged-in claude.ai request (DevTools -> Network -> any request -> Request Headers -> Cookie). It must contain sessionKey=... ; including cf_clearance/__cf_bm helps clear Cloudflare. `org_name` is just a label for the dashboard dropdown. When a cookie expires the dashboard flags that org. Leave the array empty to disable Team Activity collection.",
+
+  "analytics_orgs": [
+    {
+      "org":      "00000000-0000-0000-0000-000000000000",
+      "org_name": "Example Org",
+      "cookie":   "sessionKey=sk-ant-sid...; cf_clearance=...; __cf_bm=..."
+    }
+  ]
 }

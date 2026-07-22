@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.8.10"
+USER_AGENT = "claude-usage-collector/1.9.0"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -1229,10 +1229,15 @@ def cmd_usage(args):
 
     try:
         cookie = get_session_cookie()
-    except PermissionError as e:
-        # Cookie locked and user declined the restart (or no admin/UI). Not an
-        # error -- just skip quietly and try again on the next scheduled run.
-        print(f"usage: skipped - {e}")
+    except (PermissionError, FileNotFoundError, ValueError, OSError,
+            ImportError) as e:
+        # Expected "can't read Desktop usage on this machine" cases, e.g.:
+        #   FileNotFoundError - Claude Desktop not installed (no cookie store)
+        #   PermissionError   - cookie DB locked and user declined the restart
+        #   ValueError        - no sessionKey / v20 app-bound / bad key format
+        #   OSError           - DPAPI decrypt failed (wrong user)
+        # None of these are a crash -- skip quietly and move on.
+        print(f"usage: skipped - {str(e).splitlines()[0]}")
         return
     data = read_usage(cookie)
     print_usage(data)
@@ -1250,6 +1255,38 @@ def cmd_usage(args):
         except FileNotFoundError:
             cfg = {}   # push_usage skips cleanly when server_url/token absent
         push_usage(data, cfg)
+
+
+def cmd_team_activity(args):
+    """Collect claude.ai per-user admin analytics for each configured org and
+    push it to the dashboard (daily). See team_activity.py."""
+    import team_activity
+
+    if args.install_task is not None:
+        exe = sys.executable
+        tv = args.install_task
+        fleet = getattr(args, "fleet", False)
+        if tv != "__flag__" and ":" in tv:
+            team_activity.install_task(exe, every=1, unit="days", at_time=tv,
+                                       fleet=fleet)
+        else:
+            team_activity.install_task(exe, every=args.every, unit=args.unit,
+                                       at_time=args.at, fleet=fleet)
+        return
+
+    if args.uninstall_task:
+        team_activity.uninstall_task()
+        return
+
+    try:
+        cfg, path = load_config(getattr(args, "config", None))
+    except FileNotFoundError:
+        cfg = {}
+    code = team_activity.collect_and_push(
+        cfg, snapshot_date=args.date, start_date=args.start_date,
+        no_push=args.no_push)
+    if code:
+        sys.exit(code)
 
 
 def main(argv=None):
@@ -1294,6 +1331,33 @@ def main(argv=None):
     p_usage.add_argument("--uninstall-task", action="store_true",
                          help="Remove the usage task")
     p_usage.set_defaults(func=cmd_usage)
+
+    p_team = sub.add_parser(
+        "team-activity",
+        help="Collect claude.ai per-user admin analytics (daily) and push it")
+    p_team.add_argument("--date", metavar="YYYY-MM-DD",
+                        help="Date to tag the data with (default: today)")
+    p_team.add_argument("--start-date", metavar="YYYY-MM-DD",
+                        help="Analytics window start sent to claude.ai "
+                             "(default: today, or today minus analytics_days_back)")
+    p_team.add_argument("--no-push", action="store_true",
+                        help="Fetch only; don't upload")
+    p_team.add_argument("--install-task", metavar="HH:MM", nargs="?",
+                        const="__flag__",
+                        help="Register the recurring team-activity task "
+                             "(use --every/--unit, or pass HH:MM for daily)")
+    p_team.add_argument("--every", type=int, default=1,
+                        help="Interval count for --install-task (default 1)")
+    p_team.add_argument("--unit", default="days",
+                        help="Interval unit: minutes|hours|days|weeks")
+    p_team.add_argument("--at", default="08:00", metavar="HH:MM",
+                        help="Time of day for days/weeks (default 08:00)")
+    p_team.add_argument("--fleet", action="store_true",
+                        help="Register the task for the logged-on user "
+                             "(BUILTIN\\Users) - for silent/Intune installs")
+    p_team.add_argument("--uninstall-task", action="store_true",
+                        help="Remove the team-activity task")
+    p_team.set_defaults(func=cmd_team_activity)
 
     args = parser.parse_args(argv)
     try:

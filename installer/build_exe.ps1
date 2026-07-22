@@ -43,6 +43,9 @@ python -m pip install --quiet --upgrade pystray Pillow pycryptodome
 #  --clean            wipe PyInstaller cache for repeatable builds
 #  --name             output filename (drops the .py)
 $desktopUsage = Join-Path $root '..\collector\desktop_usage.py' | Resolve-Path
+# team_activity.py is imported lazily (inside cmd_team_activity), so PyInstaller's
+# static analysis won't find it -- bundle it explicitly like desktop_usage.
+$teamActivity = Join-Path $root '..\collector\team_activity.py' | Resolve-Path
 
 python -m PyInstaller `
     --onefile `
@@ -54,9 +57,11 @@ python -m PyInstaller `
     --workpath $buildDir `
     --specpath $buildDir `
     --hidden-import 'desktop_usage' `
+    --hidden-import 'team_activity' `
     --hidden-import 'Crypto.Cipher.AES' `
     --hidden-import 'Crypto.Cipher._mode_gcm' `
     --add-data "$($desktopUsage);." `
+    --add-data "$($teamActivity);." `
     $collector
 
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed for collector (exit $LASTEXITCODE)" }
