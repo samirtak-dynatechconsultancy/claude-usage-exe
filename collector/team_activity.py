@@ -10,9 +10,11 @@ Reads `analytics_orgs` from config.json — a list of:
     {"org": "<org-uuid>", "org_name": "<label>", "cookie": "<full Cookie header>"}
 
 Designed to run DAILY via a Windows Scheduled Task (ClaudeTeamActivityDaily).
-Each run uses start_date = yesterday by default (the endpoint requires a PAST
-start_date — start_date = today returns HTTP 400) and tags the result with
-today's date; re-running the same day overwrites that day's rows server-side.
+Each run collects ONE calendar day using the window [day, day+1) (so the numbers
+are that day alone) and stores it under that day's snapshot_date. Default day =
+yesterday (the endpoint 400s on today, and only a completed day has settled
+data). `team-activity --backfill 30` collects the last 30 days one by one;
+`--reset` wipes stored data first.
 
 Imported by collector.py for the `team-activity` subcommand. Stdlib-only.
 """
@@ -38,10 +40,10 @@ TASK_NAME = "ClaudeTeamActivityDaily"
 HTTP_TIMEOUT = 30
 PAGE_SIZE = 50
 MAX_PAGES = 1000         # safety cap only; real stop is an empty members array
-# Default days back for start_date: 1 = yesterday. The analytics endpoint
-# returns per-user activity SINCE start_date and rejects a same-day/future
-# start_date with HTTP 400, so this must be >= 1. Overridable via config
-# "analytics_days_back" or the --start-date CLI flag.
+# Which single day a plain daily run collects, as days back from today.
+# 1 = yesterday. Must be >= 1: the endpoint 400s on today/future and only a
+# completed day has settled data. Overridable via config "analytics_days_back"
+# or the --date CLI flag.
 DEFAULT_DAYS_BACK = 1
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -60,10 +62,14 @@ log = _default_log
 # Fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_page(org: str, cookie: str, start_date: str, page: int) -> dict:
-    """GET one page of the activity endpoint. Raises HTTPError/URLError/ValueError."""
+def _fetch_page(org: str, cookie: str, start_date: str, end_date: str,
+                page: int) -> dict:
+    """GET one page of the activity endpoint. Raises HTTPError/URLError/ValueError.
+
+    The window is [start_date, end_date). For a single calendar day D, pass
+    start_date=D and end_date=D+1 -> the response's data_as_of == D."""
     qs = (f"?page={page}&page_size={PAGE_SIZE}&sort=chats&order=desc"
-          f"&start_date={start_date}")
+          f"&start_date={start_date}&end_date={end_date}")
     url = CLAUDE_AI_BASE + ACTIVITY_EP.format(org=org) + qs
     req = urlrequest.Request(url, headers={
         "Cookie": cookie,
@@ -91,13 +97,15 @@ def _member_key(m: dict, page: int, idx: int) -> str:
     return f"pos:{page}:{idx}"
 
 
-def fetch_all_members(org: str, cookie: str, start_date: str) -> List[dict]:
-    """Page through the activity endpoint, incrementing `page` (page_size=50,
-    sort=chats, order=desc), and return every member object.
+def fetch_all_members(org: str, cookie: str, start_date: str,
+                      end_date: str) -> List[dict]:
+    """Page through the activity endpoint for the window [start_date, end_date),
+    incrementing `page` (page_size=50, sort=chats, order=desc), and return every
+    member object.
 
     Stop condition: keep going until claude.ai returns an empty members array
-    (`"members": []`), exactly as requested. Two extra guards, neither of which
-    can end collection early while real users are still coming back:
+    (`"members": []`). Two extra guards, neither of which can end collection
+    early while real users are still coming back:
       • MAX_PAGES — a hard ceiling so a misbehaving endpoint can't loop forever.
       • no-new-members — if a page returns only users we've already collected
         (some APIs clamp an out-of-range page to the last page and keep
@@ -106,7 +114,7 @@ def fetch_all_members(org: str, cookie: str, start_date: str) -> List[dict]:
     members: List[dict] = []
     seen: set = set()
     for page in range(1, MAX_PAGES + 1):
-        data = _fetch_page(org, cookie, start_date, page)
+        data = _fetch_page(org, cookie, start_date, end_date, page)
         batch = data.get("members", []) if isinstance(data, dict) else []
         if not batch:            # "members": [] -> we're past the last page
             break
@@ -164,82 +172,140 @@ def _classify_error(exc: Exception) -> str:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def collect_and_push(cfg: Dict, snapshot_date: Optional[str] = None,
-                     start_date: Optional[str] = None,
-                     no_push: bool = False) -> int:
-    """Collect + push team activity for every configured org.
-
-    snapshot_date: the date to TAG the data with (default: today, local).
-    start_date:    the analytics window start passed to claude.ai
-                   (default: snapshot_date minus `analytics_days_back`).
-    Returns a process exit code (0 = all orgs OK, 1 = at least one failed).
-    """
+def _valid_orgs(cfg: Dict) -> List[dict]:
     orgs = cfg.get("analytics_orgs") or []
-    if not orgs:
-        log("team-activity: no analytics_orgs configured -- nothing to do. "
-            "Add org+cookie pairs to config.json (see analytics_orgs).")
-        return 0
-
-    today = date.today()
-    snap = snapshot_date or today.isoformat()
-    if start_date:
-        window_start = start_date
-    else:
-        # start_date MUST be a past date -- the endpoint 400s on today/future.
-        days_back = int(cfg.get("analytics_days_back", DEFAULT_DAYS_BACK)
-                        or DEFAULT_DAYS_BACK)
-        if days_back < 1:
-            days_back = 1
-        window_start = (today - timedelta(days=days_back)).isoformat()
-
-    log(f"team-activity START: snapshot_date={snap} start_date={window_start} "
-        f"orgs={len(orgs)}", section=True)
-
-    any_failed = False
+    out = []
     for entry in orgs:
         org = (entry.get("org") or "").strip()
-        org_name = entry.get("org_name") or org
         cookie = entry.get("cookie") or ""
-        if not org or not cookie:
-            log(f"  - skipping malformed org entry (need org + cookie): "
-                f"{org_name!r}", level="WARN")
-            any_failed = True
-            continue
-
-        ok, err, members = True, None, []
-        try:
-            members = fetch_all_members(org, cookie, window_start)
-            log(f"  - {org_name}: fetched {len(members)} users")
-        except Exception as exc:  # noqa: BLE001 - report every failure, keep going
-            ok, err = False, _classify_error(exc)
-            log(f"  - {org_name}: FAILED -- {err}", level="ERROR")
-
-        payload = {
-            "kind":          "team_activity",
-            "org":           org,
-            "org_name":      org_name,
-            "snapshot_date": snap,
-            "ok":            ok,
-            "error":         err,
-            "members":       members,
-        }
-
-        if no_push:
-            log(f"    (--no-push) would upload {len(members)} rows, ok={ok}")
+        if org and cookie:
+            out.append(entry)
         else:
-            pushed, msg = _push(cfg, payload)
-            if pushed:
-                log(f"    pushed OK ({len(members)} rows, ok={ok})")
-            else:
-                log(f"    push FAILED -- {msg}", level="ERROR")
-                any_failed = True
+            log(f"  - skipping malformed org entry (need org + cookie): "
+                f"{entry.get('org_name') or org!r}", level="WARN")
+    return out
 
-        if not ok:
+
+def _collect_one_day(cfg: Dict, entry: dict, day: date,
+                     no_push: bool) -> bool:
+    """Collect + push a single calendar `day` for one org. Window is
+    [day, day+1) so the numbers are that day's activity alone. snapshot_date =
+    day. Returns True on success."""
+    org = (entry.get("org") or "").strip()
+    org_name = entry.get("org_name") or org
+    cookie = entry.get("cookie") or ""
+    start = day.isoformat()
+    end = (day + timedelta(days=1)).isoformat()
+
+    ok, err, members = True, None, []
+    try:
+        members = fetch_all_members(org, cookie, start, end)
+        log(f"  - {org_name} {start}: {len(members)} users")
+    except Exception as exc:  # noqa: BLE001 - report every failure, keep going
+        ok, err = False, _classify_error(exc)
+        log(f"  - {org_name} {start}: FAILED -- {err}", level="ERROR")
+
+    payload = {
+        "kind":          "team_activity",
+        "org":           org,
+        "org_name":      org_name,
+        "snapshot_date": start,
+        "ok":            ok,
+        "error":         err,
+        "members":       members,
+    }
+
+    if no_push:
+        log(f"      (--no-push) would upload {len(members)} rows, ok={ok}")
+        return ok
+    if not ok:
+        # Still push the failure so the dashboard can flag the cookie, but only
+        # for a "today"-ish run; for a backfill day, a failure is just skipped.
+        _push(cfg, payload)
+        return False
+    pushed, msg = _push(cfg, payload)
+    if not pushed:
+        log(f"      push FAILED -- {msg}", level="ERROR")
+        return False
+    return True
+
+
+def _default_day(cfg: Dict) -> date:
+    """The single day a plain daily run collects: yesterday by default. The
+    endpoint 400s on today, so this is clamped to at least 1 day back."""
+    days_back = int(cfg.get("analytics_days_back", DEFAULT_DAYS_BACK)
+                    or DEFAULT_DAYS_BACK)
+    if days_back < 1:
+        days_back = 1
+    return date.today() - timedelta(days=days_back)
+
+
+def collect_and_push(cfg: Dict, day: Optional[str] = None,
+                     no_push: bool = False) -> int:
+    """Collect + push ONE day for every configured org (default: yesterday).
+    Returns a process exit code (0 = all OK, 1 = at least one failed)."""
+    orgs = _valid_orgs(cfg)
+    if not orgs:
+        log("team-activity: no analytics_orgs configured -- nothing to do.")
+        return 0
+
+    d = date.fromisoformat(day) if day else _default_day(cfg)
+    log(f"team-activity START: day={d.isoformat()} orgs={len(orgs)}",
+        section=True)
+    any_failed = False
+    for entry in orgs:
+        if not _collect_one_day(cfg, entry, d, no_push):
             any_failed = True
-
     log(f"team-activity DONE: {'OK' if not any_failed else 'with failures'}",
         section=True)
     return 1 if any_failed else 0
+
+
+def backfill(cfg: Dict, days: int = 30, no_push: bool = False) -> int:
+    """Collect + push each of the last `days` calendar days, one by one, from
+    oldest to yesterday (today isn't collectable -- the endpoint 400s on it).
+    Each day is stored under its own snapshot_date."""
+    orgs = _valid_orgs(cfg)
+    if not orgs:
+        log("team-activity: no analytics_orgs configured -- nothing to do.")
+        return 0
+    if days < 1:
+        days = 1
+
+    today = date.today()
+    start_day = today - timedelta(days=days)   # inclusive
+    end_day = today - timedelta(days=1)         # yesterday, inclusive
+    total = (end_day - start_day).days + 1
+    log(f"team-activity BACKFILL START: {start_day.isoformat()} .. "
+        f"{end_day.isoformat()} ({total} days) orgs={len(orgs)}", section=True)
+
+    any_failed = False
+    d = start_day
+    while d <= end_day:
+        for entry in orgs:
+            if not _collect_one_day(cfg, entry, d, no_push):
+                any_failed = True
+        d += timedelta(days=1)
+
+    log(f"team-activity BACKFILL DONE: {'OK' if not any_failed else 'with failures'}",
+        section=True)
+    return 1 if any_failed else 0
+
+
+def reset(cfg: Dict, org: Optional[str] = None) -> int:
+    """Ask the dashboard to wipe stored team-activity data (all orgs, or one)
+    so a backfill can repopulate cleanly."""
+    payload = {"kind": "team_activity_reset"}
+    if org:
+        payload["org"] = org
+    if not (cfg.get("server_url") and cfg.get("ingest_token")):
+        log("team-activity reset: server_url/ingest_token not in config",
+            level="ERROR")
+        return 1
+    pushed, msg = _push(cfg, payload)
+    log(f"team-activity RESET ({org or 'all'}): {msg}",
+        level="INFO" if pushed else "ERROR")
+    return 0 if pushed else 1
 
 
 # ---------------------------------------------------------------------------

@@ -1287,9 +1287,20 @@ def cmd_team_activity(args):
         cfg, path = load_config(getattr(args, "config", None))
     except FileNotFoundError:
         cfg = {}
-    code = team_activity.collect_and_push(
-        cfg, snapshot_date=args.date, start_date=args.start_date,
-        no_push=args.no_push)
+
+    code = 0
+    did = False
+    if args.reset:
+        code |= team_activity.reset(cfg)
+        did = True
+    if args.backfill is not None:
+        code |= team_activity.backfill(cfg, days=args.backfill,
+                                       no_push=args.no_push)
+    elif args.date:
+        code |= team_activity.collect_and_push(cfg, day=args.date,
+                                               no_push=args.no_push)
+    elif not did:
+        code |= team_activity.collect_and_push(cfg, no_push=args.no_push)
     if code:
         sys.exit(code)
 
@@ -1341,10 +1352,15 @@ def main(argv=None):
         "team-activity",
         help="Collect claude.ai per-user admin analytics (daily) and push it")
     p_team.add_argument("--date", metavar="YYYY-MM-DD",
-                        help="Date to tag the data with (default: today)")
-    p_team.add_argument("--start-date", metavar="YYYY-MM-DD",
-                        help="Analytics window start sent to claude.ai "
-                             "(default: today, or today minus analytics_days_back)")
+                        help="Collect a single day (window [date, date+1); "
+                             "default: yesterday)")
+    p_team.add_argument("--backfill", nargs="?", const=30, type=int,
+                        metavar="DAYS",
+                        help="Collect the last DAYS days, one per day "
+                             "(default 30 if no number given), up to yesterday")
+    p_team.add_argument("--reset", action="store_true",
+                        help="Wipe stored team-activity data first (all orgs). "
+                             "Combine with --backfill to rebuild from scratch")
     p_team.add_argument("--no-push", action="store_true",
                         help="Fetch only; don't upload")
     p_team.add_argument("--install-task", metavar="HH:MM", nargs="?",

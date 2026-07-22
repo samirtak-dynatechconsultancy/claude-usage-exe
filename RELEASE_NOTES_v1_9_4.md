@@ -1,13 +1,41 @@
-# v1.9.4 — Team Activity window defaults to yesterday
+# v1.9.4 — Team Activity: true per-day data + backfill + reset
 
-v1.9.3 defaulted the daily Team Activity window to the **past 7 days**. This
-release changes the default to **yesterday** (`start_date` = yesterday's date),
-so each daily run reflects the most recent day rather than a trailing week.
+## Per-day windows (not a trailing 7-day total)
 
-- `analytics_days_back` now defaults to **1** (yesterday). It still must be
-  `>= 1` — the claude.ai analytics endpoint rejects a same-day/future
-  `start_date` with HTTP 400.
-- Want a longer trailing window instead? Set `analytics_days_back` to `7` (or
-  any number) in `config.json`, or pass `--start-date YYYY-MM-DD` for a one-off.
+Each Team Activity run now collects **one calendar day** of per-user activity
+using the window `[day, day+1)` — so the numbers are that day alone, not a
+running total since some start date. The claude.ai analytics endpoint does
+support an `end_date`, which makes clean single-day snapshots possible.
 
-No other behavior changes from v1.9.3.
+- **Default daily run** collects **yesterday** (the endpoint 400s on today, and
+  only a completed day has settled data). Configurable with
+  `analytics_days_back` (1 = yesterday) or `--date YYYY-MM-DD`.
+- Each day is stored under its own `snapshot_date`, so the dashboard's date
+  dropdown shows one entry per day.
+
+## Backfill history
+
+```
+ClaudeUsageCollector.exe team-activity --backfill 30
+```
+
+Collects the **last 30 days, one day at a time**, up to yesterday. Pass a number
+to change the span (`--backfill 60`). Great for populating the dashboard with a
+month of history in one go.
+
+## Reset
+
+```
+ClaudeUsageCollector.exe team-activity --reset            # wipe all, then...
+ClaudeUsageCollector.exe team-activity --reset --backfill 30
+```
+
+`--reset` asks the dashboard to delete stored team-activity data (all orgs)
+before repopulating — a clean rebuild. (Requires the matching dashboard update
+that adds the reset endpoint.)
+
+## Notes
+
+- Removed the old `--start-date` flag; use `--date` (single day) or `--backfill`.
+- `analytics_days_back` now means "which single day to collect," default **1**
+  (yesterday), not a trailing-window length.
