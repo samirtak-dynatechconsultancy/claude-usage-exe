@@ -1,4 +1,6 @@
-# v1.9.4 — Team Activity: true per-day data + backfill + reset
+# v1.9.5 — Team Activity: true per-day data + backfill + reset
+
+(v1.9.4 shipped the smaller "default to yesterday" change; this release adds the full per-day model below.)
 
 ## Per-day windows (not a trailing 7-day total)
 
