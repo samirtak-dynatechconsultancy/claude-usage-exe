@@ -10,10 +10,9 @@ Reads `analytics_orgs` from config.json — a list of:
     {"org": "<org-uuid>", "org_name": "<label>", "cookie": "<full Cookie header>"}
 
 Designed to run DAILY via a Windows Scheduled Task (ClaudeTeamActivityDaily).
-Each run collects a trailing window of per-user activity (default: the last 7
-days, since the endpoint requires start_date to be a PAST date — start_date =
-today returns HTTP 400) and tags it with today's date; re-running the same day
-overwrites that day's rows server-side.
+Each run uses start_date = yesterday by default (the endpoint requires a PAST
+start_date — start_date = today returns HTTP 400) and tags the result with
+today's date; re-running the same day overwrites that day's rows server-side.
 
 Imported by collector.py for the `team-activity` subcommand. Stdlib-only.
 """
@@ -39,11 +38,11 @@ TASK_NAME = "ClaudeTeamActivityDaily"
 HTTP_TIMEOUT = 30
 PAGE_SIZE = 50
 MAX_PAGES = 1000         # safety cap only; real stop is an empty members array
-# Default trailing window (days back) for start_date. The analytics endpoint
+# Default days back for start_date: 1 = yesterday. The analytics endpoint
 # returns per-user activity SINCE start_date and rejects a same-day/future
 # start_date with HTTP 400, so this must be >= 1. Overridable via config
 # "analytics_days_back" or the --start-date CLI flag.
-DEFAULT_DAYS_BACK = 7
+DEFAULT_DAYS_BACK = 1
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 

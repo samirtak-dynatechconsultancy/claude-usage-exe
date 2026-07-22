@@ -22,7 +22,7 @@
     }
   ],
 
-  "_comment_5": "analytics_days_back is how many days back the daily Team Activity window starts. The claude.ai analytics endpoint returns per-user activity SINCE start_date and REJECTS a same-day/future start_date with HTTP 400, so this must be >= 1. Default 7 = a trailing one-week window, refreshed daily and tagged with the run date.",
+  "_comment_5": "analytics_days_back is how many days back the daily Team Activity window starts. The claude.ai analytics endpoint returns per-user activity SINCE start_date and REJECTS a same-day/future start_date with HTTP 400, so this must be >= 1. Default 1 = yesterday. Increase it for a longer trailing window (e.g. 7 for the past week).",
 
-  "analytics_days_back": 7
+  "analytics_days_back": 1
 }
