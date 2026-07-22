@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.8.9"
+#define MyAppVersion    "1.8.10"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -188,6 +188,11 @@ begin
     and the new install's [Run] section restarts both. }
   Exec('taskkill.exe', '/F /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
   Exec('taskkill.exe', '/F /IM "{#MyTrayExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
+  { v1.8.10: clear any stale usage task from an older version (it may have a
+    pre-CREATE_NO_WINDOW action that flashed cmd windows). The [Run] section
+    re-registers a clean one. Also stop a usage run in progress: killing the
+    exe above already ends it (wscript launched it and did not wait). }
+  Exec('schtasks.exe', '/Delete /F /TN "ClaudeUsageDaily"', '', SW_HIDE, ewWaitUntilTerminated, ErrorCode);
   Result := '';
 end;
 
