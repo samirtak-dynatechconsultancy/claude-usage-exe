@@ -20,5 +20,9 @@
       "org_name": "Example Org",
       "cookie":   "sessionKey=sk-ant-sid...; cf_clearance=...; __cf_bm=..."
     }
-  ]
+  ],
+
+  "_comment_5": "analytics_days_back is how many days back the daily Team Activity window starts. The claude.ai analytics endpoint returns per-user activity SINCE start_date and REJECTS a same-day/future start_date with HTTP 400, so this must be >= 1. Default 7 = a trailing one-week window, refreshed daily and tagged with the run date.",
+
+  "analytics_days_back": 7
 }

@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.9.2"
+USER_AGENT = "claude-usage-collector/1.9.3"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -1261,6 +1261,11 @@ def cmd_team_activity(args):
     """Collect claude.ai per-user admin analytics for each configured org and
     push it to the dashboard (daily). See team_activity.py."""
     import team_activity
+
+    # Route team-activity output into collector.log. The frozen exe is
+    # --windowed, so bare print() would be lost -- this is why early runs
+    # left no trace. log() also mirrors to stdout when a console exists.
+    team_activity.log = log
 
     if args.install_task is not None:
         exe = sys.executable

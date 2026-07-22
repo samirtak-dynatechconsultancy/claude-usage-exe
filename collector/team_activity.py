@@ -10,8 +10,10 @@ Reads `analytics_orgs` from config.json — a list of:
     {"org": "<org-uuid>", "org_name": "<label>", "cookie": "<full Cookie header>"}
 
 Designed to run DAILY via a Windows Scheduled Task (ClaudeTeamActivityDaily).
-Each run collects "today's" activity per user and tags it with today's date;
-re-running the same day overwrites that day's rows server-side.
+Each run collects a trailing window of per-user activity (default: the last 7
+days, since the endpoint requires start_date to be a PAST date — start_date =
+today returns HTTP 400) and tags it with today's date; re-running the same day
+overwrites that day's rows server-side.
 
 Imported by collector.py for the `team-activity` subcommand. Stdlib-only.
 """
@@ -37,8 +39,22 @@ TASK_NAME = "ClaudeTeamActivityDaily"
 HTTP_TIMEOUT = 30
 PAGE_SIZE = 50
 MAX_PAGES = 1000         # safety cap only; real stop is an empty members array
+# Default trailing window (days back) for start_date. The analytics endpoint
+# returns per-user activity SINCE start_date and rejects a same-day/future
+# start_date with HTTP 400, so this must be >= 1. Overridable via config
+# "analytics_days_back" or the --start-date CLI flag.
+DEFAULT_DAYS_BACK = 7
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+# Logging: collector.py injects its log() here so team-activity runs land in
+# collector.log (the frozen exe is windowed, so bare print() output is lost).
+def _default_log(msg, level="INFO", section=False):
+    print(msg)
+
+
+log = _default_log
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +177,8 @@ def collect_and_push(cfg: Dict, snapshot_date: Optional[str] = None,
     """
     orgs = cfg.get("analytics_orgs") or []
     if not orgs:
-        print("team-activity: no analytics_orgs configured -- nothing to do. "
-              "Add org+cookie pairs to config.json (see analytics_orgs).")
+        log("team-activity: no analytics_orgs configured -- nothing to do. "
+            "Add org+cookie pairs to config.json (see analytics_orgs).")
         return 0
 
     today = date.today()
@@ -170,11 +186,15 @@ def collect_and_push(cfg: Dict, snapshot_date: Optional[str] = None,
     if start_date:
         window_start = start_date
     else:
-        days_back = int(cfg.get("analytics_days_back", 0) or 0)
+        # start_date MUST be a past date -- the endpoint 400s on today/future.
+        days_back = int(cfg.get("analytics_days_back", DEFAULT_DAYS_BACK)
+                        or DEFAULT_DAYS_BACK)
+        if days_back < 1:
+            days_back = 1
         window_start = (today - timedelta(days=days_back)).isoformat()
 
-    print(f"team-activity: snapshot_date={snap} start_date={window_start} "
-          f"orgs={len(orgs)}")
+    log(f"team-activity START: snapshot_date={snap} start_date={window_start} "
+        f"orgs={len(orgs)}", section=True)
 
     any_failed = False
     for entry in orgs:
@@ -182,18 +202,18 @@ def collect_and_push(cfg: Dict, snapshot_date: Optional[str] = None,
         org_name = entry.get("org_name") or org
         cookie = entry.get("cookie") or ""
         if not org or not cookie:
-            print(f"  - skipping malformed org entry (need org + cookie): "
-                  f"{org_name!r}")
+            log(f"  - skipping malformed org entry (need org + cookie): "
+                f"{org_name!r}", level="WARN")
             any_failed = True
             continue
 
         ok, err, members = True, None, []
         try:
             members = fetch_all_members(org, cookie, window_start)
-            print(f"  - {org_name}: fetched {len(members)} users")
+            log(f"  - {org_name}: fetched {len(members)} users")
         except Exception as exc:  # noqa: BLE001 - report every failure, keep going
             ok, err = False, _classify_error(exc)
-            print(f"  - {org_name}: FAILED -- {err}")
+            log(f"  - {org_name}: FAILED -- {err}", level="ERROR")
 
         payload = {
             "kind":          "team_activity",
@@ -206,18 +226,20 @@ def collect_and_push(cfg: Dict, snapshot_date: Optional[str] = None,
         }
 
         if no_push:
-            print(f"    (--no-push) would upload {len(members)} rows, ok={ok}")
+            log(f"    (--no-push) would upload {len(members)} rows, ok={ok}")
         else:
             pushed, msg = _push(cfg, payload)
             if pushed:
-                print(f"    pushed OK ({len(members)} rows, ok={ok})")
+                log(f"    pushed OK ({len(members)} rows, ok={ok})")
             else:
-                print(f"    push FAILED -- {msg}")
+                log(f"    push FAILED -- {msg}", level="ERROR")
                 any_failed = True
 
         if not ok:
             any_failed = True
 
+    log(f"team-activity DONE: {'OK' if not any_failed else 'with failures'}",
+        section=True)
     return 1 if any_failed else 0
 
 

@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.9.2"
+#define MyAppVersion    "1.9.3"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -155,6 +155,14 @@ Filename: "{app}\{#MyAppExeName}"; \
     Parameters: "team-activity --install-task --every 1 --unit days --at 08:00 --fleet"; \
     Flags: runhidden; \
     StatusMsg: "Scheduling daily Team Activity collection..."
+
+; Collect Team Activity once now so the dashboard shows data immediately after
+; install (instead of waiting for the 08:00 task). Hidden via the wscript
+; launcher; no-ops if analytics_orgs is empty. skipifsilent keeps SYSTEM/Intune
+; installs from running it before the user has entered cookies.
+Filename: "{sys}\wscript.exe"; Parameters: """{app}\run_team_activity.vbs"""; \
+    Flags: runhidden nowait skipifsilent; \
+    StatusMsg: "Collecting Team Activity now..."
 
 [UninstallRun]
 ; Kill the running daemon + tray processes so Inno Setup can delete their
@@ -510,6 +518,7 @@ begin
     '  "ingest_token":   "' + ingestTok + '",' + #13#10 +
     '  "upload_content": ' + uploadContentStr + ',' + #13#10 +
     '  "projects_dirs":  null,' + #13#10 +
+    '  "analytics_days_back": 7,' + #13#10 +
     analyticsBlock + #13#10 +
     '}' + #13#10;
   SaveStringToFile(configPath, contents, False);
