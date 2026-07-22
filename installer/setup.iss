@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.9.0"
+#define MyAppVersion    "1.9.1"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -193,6 +193,8 @@ var
   PrivacyPage: TInputOptionWizardPage;
   IntervalUnitPage:   TInputOptionWizardPage;
   IntervalDetailPage: TInputQueryWizardPage;
+  TeamActivityPage:   TWizardPage;
+  TeamMemo:           TNewMemo;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
@@ -231,6 +233,7 @@ end;
 procedure InitializeWizard;
 var
   ConsentText: TArrayOfString;
+  TeamActivityLabel: TNewStaticText;
 begin
   { Load the consent file shipped in [Files]; if missing, fall back to inline.}
   if not LoadStringsFromFile(ExpandConstant('{tmp}\CONSENT.txt'), ConsentText) then
@@ -316,6 +319,96 @@ begin
   IntervalDetailPage.Add('Time of day HH:MM (Days/Weeks only):', False);
   IntervalDetailPage.Values[0] := '1';
   IntervalDetailPage.Values[1] := '18:00';
+
+  { v1.9.0: Team Activity org+cookie pairs. Collected here and written into
+    config.json's analytics_orgs so the daily `team-activity` task can fetch
+    claude.ai per-user admin analytics. One org per line, pipe-delimited:
+        ORG_UUID | Label | Cookie
+    The cookie is the FULL Cookie header from a logged-in claude.ai request
+    and may itself contain '|'-free but quote/brace-heavy text, so parsing
+    splits on only the FIRST TWO pipes and JSON-escapes each field. }
+  TeamActivityPage := CreateCustomPage(
+    IntervalDetailPage.ID,
+    'Team Activity (optional)',
+    'Collect claude.ai per-user admin analytics for your organizations');
+
+  TeamActivityLabel := TNewStaticText.Create(TeamActivityPage);
+  TeamActivityLabel.Parent := TeamActivityPage.Surface;
+  TeamActivityLabel.Left := 0;
+  TeamActivityLabel.Top := 0;
+  TeamActivityLabel.Width := TeamActivityPage.SurfaceWidth;
+  TeamActivityLabel.AutoSize := False;
+  TeamActivityLabel.Height := 90;
+  TeamActivityLabel.WordWrap := True;
+  TeamActivityLabel.Caption :=
+    'One organization per line, in this exact format (spaces around | optional):' + #13#10 +
+    '    ORG_UUID | Label | Cookie' + #13#10 +
+    '- ORG_UUID: the organization UUID (from the /organizations/<UUID>/ URL).' + #13#10 +
+    '- Label: any name shown in the dashboard dropdown.' + #13#10 +
+    '- Cookie: the FULL Cookie header from a logged-in claude.ai request ' +
+    '(DevTools > Network > any request > Request Headers > Cookie; must contain sessionKey=...).' + #13#10 +
+    'Leave blank to skip. You can add or update orgs later via Start Menu > Edit config.';
+
+  TeamMemo := TNewMemo.Create(TeamActivityPage);
+  TeamMemo.Parent := TeamActivityPage.Surface;
+  TeamMemo.Left := 0;
+  TeamMemo.Top := 96;
+  TeamMemo.Width := TeamActivityPage.SurfaceWidth;
+  TeamMemo.Height := TeamActivityPage.SurfaceHeight - 96;
+  TeamMemo.ScrollBars := ssBoth;
+  TeamMemo.WordWrap := False;
+end;
+
+{ Escape a string for embedding inside a JSON double-quoted value. Order
+  matters: backslashes first, then double quotes. Handles cookies that carry
+  quote-heavy sub-values such as the g_state cookie. }
+function JsonEsc(s: String): String;
+begin
+  StringChangeEx(s, '\', '\\', True);
+  StringChangeEx(s, '"', '\"', True);
+  Result := s;
+end;
+
+{ Build the analytics_orgs JSON array body (without the surrounding brackets)
+  from the Team Activity memo. One org per line: ORG_UUID | Label | Cookie.
+  Splits on only the first two pipes so a pipe inside the cookie is preserved. }
+function BuildAnalyticsOrgs: String;
+var
+  i, p1, p2: Integer;
+  line, org, rest, name, cookie, acc: String;
+begin
+  acc := '';
+  if TeamMemo <> nil then
+  begin
+    for i := 0 to TeamMemo.Lines.Count - 1 do
+    begin
+      line := Trim(TeamMemo.Lines[i]);
+      if line <> '' then
+      begin
+        p1 := Pos('|', line);
+        if p1 > 0 then
+        begin
+          org := Trim(Copy(line, 1, p1 - 1));
+          rest := Copy(line, p1 + 1, Length(line));
+          p2 := Pos('|', rest);
+          if p2 > 0 then
+          begin
+            name := Trim(Copy(rest, 1, p2 - 1));
+            cookie := Trim(Copy(rest, p2 + 1, Length(rest)));
+            if (org <> '') and (cookie <> '') then
+            begin
+              if acc <> '' then
+                acc := acc + ',' + #13#10;
+              acc := acc + '    {"org": "' + JsonEsc(org) +
+                '", "org_name": "' + JsonEsc(name) +
+                '", "cookie": "' + JsonEsc(cookie) + '"}';
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+  Result := acc;
 end;
 
 procedure WriteConfigJson;
@@ -325,6 +418,8 @@ var
   serverUrl:         String;
   ingestTok:         String;
   uploadContentStr:  String;
+  analyticsBody:     String;
+  analyticsBlock:    String;
 begin
   { Called from the Files AfterInstall hook on CONSENT.txt (the last file).
     Runs AFTER all Files entries are copied but BEFORE the Run section
@@ -347,6 +442,14 @@ begin
 
   { Write config.json into the install dir. Use ASCII JSON so even non-ASCII
     hostnames don't trip the collector's json.loads on Python < 3.6. }
+  analyticsBody := BuildAnalyticsOrgs;
+  if analyticsBody = '' then
+    analyticsBlock := '  "analytics_orgs": []'
+  else
+    analyticsBlock := '  "analytics_orgs": [' + #13#10 +
+                      analyticsBody + #13#10 +
+                      '  ]';
+
   configPath := ExpandConstant('{app}\config.json');
   contents :=
     '{' + #13#10 +
@@ -354,7 +457,7 @@ begin
     '  "ingest_token":   "' + ingestTok + '",' + #13#10 +
     '  "upload_content": ' + uploadContentStr + ',' + #13#10 +
     '  "projects_dirs":  null,' + #13#10 +
-    '  "analytics_orgs": []' + #13#10 +
+    analyticsBlock + #13#10 +
     '}' + #13#10;
   SaveStringToFile(configPath, contents, False);
 end;
@@ -388,7 +491,8 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   url: String;
-  n: Integer;
+  n, p1, p2: Integer;
+  line, rest: String;
 begin
   Result := True;
 
@@ -414,6 +518,32 @@ begin
     begin
       MsgBox('Enter a whole number of 1 or more for the interval.', mbError, MB_OK);
       Result := False; Exit;
+    end;
+  end;
+
+  { Team Activity: validate each non-empty line parses to ORG_UUID | Label |
+    Cookie (two pipes, non-empty org + cookie). Empty page is fine (skipped). }
+  if (TeamActivityPage <> nil) and (CurPageID = TeamActivityPage.ID) then
+  begin
+    for n := 0 to TeamMemo.Lines.Count - 1 do
+    begin
+      line := Trim(TeamMemo.Lines[n]);
+      if line <> '' then
+      begin
+        p1 := Pos('|', line);
+        rest := Copy(line, p1 + 1, Length(line));
+        p2 := Pos('|', rest);
+        if (p1 = 0) or (p2 = 0)
+           or (Trim(Copy(line, 1, p1 - 1)) = '')
+           or (Trim(Copy(rest, p2 + 1, Length(rest))) = '') then
+        begin
+          MsgBox('Team Activity line ' + IntToStr(n + 1) + ' is not in the '
+                 + 'format:'#13#10'    ORG_UUID | Label | Cookie'#13#10#13#10
+                 + 'Fix it, or clear the box to skip Team Activity setup.',
+                 mbError, MB_OK);
+          Result := False; Exit;
+        end;
+      end;
     end;
   end;
 end;
