@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.9.1"
+#define MyAppVersion    "1.9.2"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -341,13 +341,13 @@ begin
   TeamActivityLabel.Height := 90;
   TeamActivityLabel.WordWrap := True;
   TeamActivityLabel.Caption :=
-    'One organization per line, in this exact format (spaces around | optional):' + #13#10 +
-    '    ORG_UUID | Label | Cookie' + #13#10 +
+    'One organization per line: ORG_UUID | Label | Cookie' + #13#10 +
     '- ORG_UUID: the organization UUID (from the /organizations/<UUID>/ URL).' + #13#10 +
     '- Label: any name shown in the dashboard dropdown.' + #13#10 +
     '- Cookie: the FULL Cookie header from a logged-in claude.ai request ' +
     '(DevTools > Network > any request > Request Headers > Cookie; must contain sessionKey=...).' + #13#10 +
-    'Leave blank to skip. You can add or update orgs later via Start Menu > Edit config.';
+    'A long cookie may wrap onto several lines - that is fine. Leave blank to skip; ' +
+    'you can add or update orgs later via Start Menu > Edit config.';
 
   TeamMemo := TNewMemo.Create(TeamActivityPage);
   TeamMemo.Parent := TeamActivityPage.Surface;
@@ -355,8 +355,8 @@ begin
   TeamMemo.Top := 96;
   TeamMemo.Width := TeamActivityPage.SurfaceWidth;
   TeamMemo.Height := TeamActivityPage.SurfaceHeight - 96;
-  TeamMemo.ScrollBars := ssBoth;
-  TeamMemo.WordWrap := False;
+  TeamMemo.ScrollBars := ssVertical;
+  TeamMemo.WordWrap := True;
 end;
 
 { Escape a string for embedding inside a JSON double-quoted value. Order
@@ -369,43 +369,96 @@ begin
   Result := s;
 end;
 
-{ Build the analytics_orgs JSON array body (without the surrounding brackets)
-  from the Team Activity memo. One org per line: ORG_UUID | Label | Cookie.
-  Splits on only the first two pipes so a pipe inside the cookie is preserved. }
-function BuildAnalyticsOrgs: String;
+{ Count occurrences of a character in a string. }
+function CountChar(const s: String; c: Char): Integer;
 var
-  i, p1, p2: Integer;
-  line, org, rest, name, cookie, acc: String;
+  i: Integer;
 begin
-  acc := '';
+  Result := 0;
+  for i := 1 to Length(s) do
+    if s[i] = c then
+      Result := Result + 1;
+end;
+
+{ Collect the Team Activity memo into one record per organization.
+
+  Users enter one org per line: ORG_UUID | Label | Cookie. But a pasted cookie
+  is long and often arrives with hard line breaks, so it can span several
+  physical lines. We stitch those back together: a line with >= 2 pipes STARTS
+  a new org record; any following line with < 2 pipes is a wrapped continuation
+  of the current record's cookie and is appended to it. (Cookies don't contain
+  '|', so pipe-count is a safe record delimiter.) Returns the record count. }
+function GetTeamRecords(var recs: TArrayOfString): Integer;
+var
+  i, n: Integer;
+  raw: String;
+begin
+  n := 0;
+  SetArrayLength(recs, 0);
   if TeamMemo <> nil then
   begin
     for i := 0 to TeamMemo.Lines.Count - 1 do
     begin
-      line := Trim(TeamMemo.Lines[i]);
-      if line <> '' then
+      raw := TeamMemo.Lines[i];
+      if Trim(raw) <> '' then
       begin
-        p1 := Pos('|', line);
-        if p1 > 0 then
+        if CountChar(raw, '|') >= 2 then
         begin
-          org := Trim(Copy(line, 1, p1 - 1));
-          rest := Copy(line, p1 + 1, Length(line));
-          p2 := Pos('|', rest);
-          if p2 > 0 then
-          begin
-            name := Trim(Copy(rest, 1, p2 - 1));
-            cookie := Trim(Copy(rest, p2 + 1, Length(rest)));
-            if (org <> '') and (cookie <> '') then
-            begin
-              if acc <> '' then
-                acc := acc + ',' + #13#10;
-              acc := acc + '    {"org": "' + JsonEsc(org) +
-                '", "org_name": "' + JsonEsc(name) +
-                '", "cookie": "' + JsonEsc(cookie) + '"}';
-            end;
-          end;
+          n := n + 1;
+          SetArrayLength(recs, n);
+          recs[n - 1] := Trim(raw);
+        end
+        else if n > 0 then
+          recs[n - 1] := recs[n - 1] + Trim(raw)
+        else
+        begin
+          n := n + 1;
+          SetArrayLength(recs, n);
+          recs[n - 1] := Trim(raw);   { malformed leading line; flagged later }
         end;
       end;
+    end;
+  end;
+  Result := n;
+end;
+
+{ Parse one record (ORG_UUID | Label | Cookie) on the first two pipes, so any
+  pipe inside the cookie is preserved. Empty out-params signal a bad record. }
+procedure ParseRec(const rec: String; var org, name, cookie: String);
+var
+  p1, p2: Integer;
+  rest: String;
+begin
+  org := ''; name := ''; cookie := '';
+  p1 := Pos('|', rec);
+  if p1 = 0 then Exit;
+  org := Trim(Copy(rec, 1, p1 - 1));
+  rest := Copy(rec, p1 + 1, Length(rec));
+  p2 := Pos('|', rest);
+  if p2 = 0 then Exit;
+  name := Trim(Copy(rest, 1, p2 - 1));
+  cookie := Trim(Copy(rest, p2 + 1, Length(rest)));
+end;
+
+{ Build the analytics_orgs JSON array body (without the surrounding brackets). }
+function BuildAnalyticsOrgs: String;
+var
+  recs: TArrayOfString;
+  i, cnt: Integer;
+  org, name, cookie, acc: String;
+begin
+  acc := '';
+  cnt := GetTeamRecords(recs);
+  for i := 0 to cnt - 1 do
+  begin
+    ParseRec(recs[i], org, name, cookie);
+    if (org <> '') and (cookie <> '') then
+    begin
+      if acc <> '' then
+        acc := acc + ',' + #13#10;
+      acc := acc + '    {"org": "' + JsonEsc(org) +
+        '", "org_name": "' + JsonEsc(name) +
+        '", "cookie": "' + JsonEsc(cookie) + '"}';
     end;
   end;
   Result := acc;
@@ -491,8 +544,9 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   url: String;
-  n, p1, p2: Integer;
-  line, rest: String;
+  n, teamCount: Integer;
+  teamRecs: TArrayOfString;
+  org, name, cookie: String;
 begin
   Result := True;
 
@@ -521,28 +575,25 @@ begin
     end;
   end;
 
-  { Team Activity: validate each non-empty line parses to ORG_UUID | Label |
-    Cookie (two pipes, non-empty org + cookie). Empty page is fine (skipped). }
+  { Team Activity: validate each org record parses to ORG_UUID | Label |
+    Cookie with a non-empty org + cookie. A wrapped/multi-line cookie is
+    stitched back together by GetTeamRecords, so a long paste is fine. Empty
+    page is fine (skipped). }
   if (TeamActivityPage <> nil) and (CurPageID = TeamActivityPage.ID) then
   begin
-    for n := 0 to TeamMemo.Lines.Count - 1 do
+    teamCount := GetTeamRecords(teamRecs);
+    for n := 0 to teamCount - 1 do
     begin
-      line := Trim(TeamMemo.Lines[n]);
-      if line <> '' then
+      ParseRec(teamRecs[n], org, name, cookie);
+      if (org = '') or (cookie = '') then
       begin
-        p1 := Pos('|', line);
-        rest := Copy(line, p1 + 1, Length(line));
-        p2 := Pos('|', rest);
-        if (p1 = 0) or (p2 = 0)
-           or (Trim(Copy(line, 1, p1 - 1)) = '')
-           or (Trim(Copy(rest, p2 + 1, Length(rest))) = '') then
-        begin
-          MsgBox('Team Activity line ' + IntToStr(n + 1) + ' is not in the '
-                 + 'format:'#13#10'    ORG_UUID | Label | Cookie'#13#10#13#10
-                 + 'Fix it, or clear the box to skip Team Activity setup.',
-                 mbError, MB_OK);
-          Result := False; Exit;
-        end;
+        MsgBox('Team Activity organization ' + IntToStr(n + 1) + ' is '
+               + 'incomplete. Enter one organization per line as:'#13#10
+               + '    ORG_UUID | Label | Cookie'#13#10#13#10
+               + 'The cookie may wrap across several lines - that is fine. '
+               + 'Or clear the box to skip Team Activity setup.',
+               mbError, MB_OK);
+        Result := False; Exit;
       end;
     end;
   end;
