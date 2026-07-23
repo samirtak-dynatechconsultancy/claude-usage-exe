@@ -41,9 +41,42 @@ ORGS_EP = "/api/organizations"
 BOOTSTRAP_EP = "/api/bootstrap"
 ACCOUNT_EP = "/api/account"
 
-_APPDATA = os.environ.get("APPDATA", "")
-COOKIE_DB_PATH = os.path.join(_APPDATA, "Claude", "Network", "Cookies")
-LOCAL_STATE_PATH = os.path.join(_APPDATA, "Claude", "Local State")
+import glob
+
+
+def _claude_data_dirs():
+    """Candidate Claude Desktop userData dirs, newest-looking first. Covers:
+      - standard installer:  %APPDATA%\\Claude
+      - Microsoft Store/MSIX: %LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude
+    Globs the package folder so we don't hardcode the publisher hash
+    (e.g. Claude_pzs8sxrjxfjjc) and it survives package updates."""
+    dirs = []
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        dirs.append(os.path.join(appdata, "Claude"))
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        dirs.extend(sorted(glob.glob(os.path.join(
+            local, "Packages", "Claude_*", "LocalCache", "Roaming", "Claude"))))
+        dirs.append(os.path.join(local, "Claude"))
+    return dirs
+
+
+def _find_claude_file(*relparts):
+    for d in _claude_data_dirs():
+        p = os.path.join(d, *relparts)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def cookie_db_path():
+    return _find_claude_file("Network", "Cookies") or _find_claude_file("Cookies")
+
+
+def local_state_path():
+    return _find_claude_file("Local State")
+
 
 USAGE_TASK_NAME = "ClaudeUsageDaily"
 HTTP_TIMEOUT = 15
@@ -106,12 +139,14 @@ def _dpapi_decrypt(encrypted: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 def _get_encryption_key() -> bytes:
-    if not os.path.exists(LOCAL_STATE_PATH):
+    ls = local_state_path()
+    if not ls:
         raise FileNotFoundError(
-            f"Claude Desktop Local State not found at {LOCAL_STATE_PATH}\n"
-            "Is Claude Desktop installed?")
+            "Claude Desktop Local State not found (checked %APPDATA%\\Claude and "
+            "the Microsoft Store package path). Is Claude Desktop installed & "
+            "signed in?")
 
-    with open(LOCAL_STATE_PATH, "r", encoding="utf-8") as f:
+    with open(ls, "r", encoding="utf-8") as f:
         local_state = json.load(f)
 
     b64_key = local_state.get("os_crypt", {}).get("encrypted_key")
@@ -220,16 +255,17 @@ def _copy_cookie_db():
       2. VSS snapshot  -> Claude open + admin  (no disruption)
       3. close/reopen  -> Claude open, no admin (brief force-quit of Claude)
     """
-    if not os.path.exists(COOKIE_DB_PATH):
+    src = cookie_db_path()
+    if not src:
         raise FileNotFoundError(
-            f"Cookie DB not found at {COOKIE_DB_PATH}\n"
-            "Is Claude Desktop installed and signed in?")
+            "Claude Desktop cookie DB not found (checked %APPDATA%\\Claude and "
+            "the Microsoft Store package path). Is Claude Desktop signed in?")
 
     tmp = tempfile.mktemp(suffix=".db")
 
     # 1. Direct copy (Claude fully closed).
     try:
-        shutil.copy2(COOKIE_DB_PATH, tmp)
+        shutil.copy2(src, tmp)
         return tmp, None
     except (PermissionError, OSError):
         pass
@@ -237,7 +273,7 @@ def _copy_cookie_db():
     # 2. VSS snapshot (needs admin) -- preferred when elevated, no disruption.
     try:
         r = subprocess.run(
-            ["esentutl.exe", "/y", "/vss", COOKIE_DB_PATH, "/d", tmp],
+            ["esentutl.exe", "/y", "/vss", src, "/d", tmp],
             capture_output=True, timeout=30, creationflags=_NO_WINDOW,
         )
         if r.returncode == 0 and os.path.exists(tmp):
@@ -255,7 +291,7 @@ def _copy_cookie_db():
                     "User declined the Claude restart -- skipping this run.")
             _close_claude()
             try:
-                shutil.copy2(COOKIE_DB_PATH, tmp)
+                shutil.copy2(src, tmp)
                 return tmp, claude_path
             except (PermissionError, OSError):
                 _start_claude(claude_path)   # restore even if the copy failed
