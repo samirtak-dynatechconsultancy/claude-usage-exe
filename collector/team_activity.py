@@ -23,12 +23,34 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
+
+
+_DEVICE = None
+
+
+def _device() -> dict:
+    """This machine's identity, sent with every team-activity push so the
+    dashboard can show which device collected an org's data. Cached."""
+    global _DEVICE
+    if _DEVICE is None:
+        try:
+            import getpass
+            user = (os.environ.get("USERNAME") or getpass.getuser() or "").strip()
+        except Exception:
+            user = ""
+        try:
+            host = socket.gethostname()
+        except Exception:
+            host = ""
+        _DEVICE = {"source_host": host or None, "os_user": user or None}
+    return _DEVICE
 
 # Reuse the scheduled-task trigger builder + no-window flag from desktop_usage.
 from desktop_usage import _usage_trigger, _NO_WINDOW
@@ -205,6 +227,7 @@ def _collect_one_day(cfg: Dict, entry: dict, day: date,
         ok, err = False, _classify_error(exc)
         log(f"  - {org_name} {start}: FAILED -- {err}", level="ERROR")
 
+    dev = _device()
     payload = {
         "kind":          "team_activity",
         "org":           org,
@@ -212,6 +235,8 @@ def _collect_one_day(cfg: Dict, entry: dict, day: date,
         "snapshot_date": start,
         "ok":            ok,
         "error":         err,
+        "source_host":   dev["source_host"],
+        "os_user":       dev["os_user"],
         "members":       members,
     }
 
