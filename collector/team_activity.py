@@ -58,6 +58,7 @@ from desktop_usage import _usage_trigger, _NO_WINDOW
 
 CLAUDE_AI_BASE = "https://claude.ai"
 ACTIVITY_EP = "/api/organizations/{org}/analytics/activity/users"
+MEMBERS_EP = "/api/organizations/{org}/members"
 TASK_NAME = "ClaudeTeamActivityDaily"
 HTTP_TIMEOUT = 30
 PAGE_SIZE = 50
@@ -180,6 +181,68 @@ def _push(cfg: Dict, payload: Dict) -> Tuple[bool, str]:
         return False, str(e)
 
 
+def fetch_roster(org: str, cookie: str) -> List[dict]:
+    """GET the full member roster (/members) -> every seat, including members
+    who have never been active (no activity rows). Each entry:
+    {uuid, email, name, role, seat_tier, created_at}."""
+    url = CLAUDE_AI_BASE + MEMBERS_EP.format(org=org)
+    req = urlrequest.Request(url, headers={
+        "Cookie": cookie, "User-Agent": _UA,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://claude.ai/",
+    })
+    with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        raw = resp.read()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise ValueError("non-JSON /members response (Cloudflare challenge?)")
+    out = []
+    for m in (data or []):
+        if not isinstance(m, dict):
+            continue
+        acc = m.get("account") or {}
+        out.append({
+            "uuid":       acc.get("uuid"),
+            "email":      acc.get("email_address"),
+            "name":       acc.get("full_name"),
+            "role":       m.get("role"),
+            "seat_tier":  m.get("seat_tier"),
+            "created_at": m.get("created_at"),
+        })
+    return out
+
+
+def push_roster(cfg: Dict, entry: dict, no_push: bool = False) -> bool:
+    """Fetch + push the member roster for one org (kind:team_roster)."""
+    org = (entry.get("org") or "").strip()
+    org_name = entry.get("org_name") or org
+    cookie = entry.get("cookie") or ""
+    try:
+        roster = fetch_roster(org, cookie)
+        log(f"  - {org_name} roster: {len(roster)} members")
+    except Exception as exc:  # noqa: BLE001
+        log(f"  - {org_name} roster: FAILED -- {_classify_error(exc)}",
+            level="WARN")
+        return False
+    dev = _device()
+    payload = {
+        "kind":        "team_roster",
+        "org":         org,
+        "org_name":    org_name,
+        "source_host": dev["source_host"],
+        "os_user":     dev["os_user"],
+        "roster":      roster,
+    }
+    if no_push:
+        log(f"      (--no-push) would upload roster of {len(roster)}")
+        return True
+    pushed, msg = _push(cfg, payload)
+    if not pushed:
+        log(f"      roster push FAILED -- {msg}", level="ERROR")
+    return pushed
+
+
 def _classify_error(exc: Exception) -> str:
     if isinstance(exc, HTTPError):
         if exc.code in (401, 403):
@@ -279,6 +342,7 @@ def collect_and_push(cfg: Dict, day: Optional[str] = None,
         section=True)
     any_failed = False
     for entry in orgs:
+        push_roster(cfg, entry, no_push)   # refresh the seat roster each run
         if not _collect_one_day(cfg, entry, d, no_push):
             any_failed = True
     log(f"team-activity DONE: {'OK' if not any_failed else 'with failures'}",
@@ -303,6 +367,9 @@ def backfill(cfg: Dict, days: int = 30, no_push: bool = False) -> int:
     total = (end_day - start_day).days + 1
     log(f"team-activity BACKFILL START: {start_day.isoformat()} .. "
         f"{end_day.isoformat()} ({total} days) orgs={len(orgs)}", section=True)
+
+    for entry in orgs:
+        push_roster(cfg, entry, no_push)   # refresh the seat roster once
 
     any_failed = False
     d = start_day
