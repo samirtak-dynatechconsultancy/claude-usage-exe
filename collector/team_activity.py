@@ -257,14 +257,46 @@ def _classify_error(exc: Exception) -> str:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def _normalize_cookie(cookie: str) -> str:
+    """Return a raw 'name=value; ...' Cookie header, tolerating a few paste
+    formats people use:
+      - a Postman/Insomnia header export: [{"key":"Cookie","value":"...",...}]
+      - a single header object:          {"key":"Cookie","value":"..."}
+      - a raw cookie string (returned unchanged).
+    """
+    s = (cookie or "").strip()
+    if s[:1] not in ("[", "{"):
+        return s
+    try:
+        data = json.loads(s)
+    except ValueError:
+        return s
+    if isinstance(data, list):
+        for h in data:
+            if (isinstance(h, dict)
+                    and str(h.get("key", "")).lower() == "cookie"
+                    and h.get("value")):
+                return str(h["value"]).strip()
+        for h in data:            # fallback: first entry that has a value
+            if isinstance(h, dict) and h.get("value"):
+                return str(h["value"]).strip()
+    elif isinstance(data, dict):
+        for k in ("value", "cookie", "Cookie"):
+            if data.get(k):
+                return str(data[k]).strip()
+    return s
+
+
 def _valid_orgs(cfg: Dict) -> List[dict]:
     orgs = cfg.get("analytics_orgs") or []
     out = []
     for entry in orgs:
         org = (entry.get("org") or "").strip()
-        cookie = entry.get("cookie") or ""
+        cookie = _normalize_cookie(entry.get("cookie") or "")
         if org and cookie:
-            out.append(entry)
+            e = dict(entry)          # don't mutate the loaded config
+            e["cookie"] = cookie
+            out.append(e)
         else:
             log(f"  - skipping malformed org entry (need org + cookie): "
                 f"{entry.get('org_name') or org!r}", level="WARN")
