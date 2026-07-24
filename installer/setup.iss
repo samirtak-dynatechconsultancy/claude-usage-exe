@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.9.7"
+#define MyAppVersion    "1.9.8"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -147,12 +147,11 @@ Filename: "{sys}\wscript.exe"; Parameters: """{app}\run_usage.vbs"""; \
 
 ; Schedule the DAILY Team Activity collection (claude.ai per-user admin
 ; analytics). Registers as BUILTIN\Users (--fleet) so it works for both
-; attended and silent/Intune installs. The task no-ops until the admin adds
-; org+cookie pairs to config.json (analytics_orgs), so registering it now is
-; harmless. Default 08:00 daily; change with --every/--unit/--at or re-run
-; `ClaudeUsageCollector.exe team-activity --install-task --at HH:MM`.
-Filename: "{app}\{#MyAppExeName}"; \
-    Parameters: "team-activity --install-task --every 1 --unit days --at 08:00 --fleet"; \
+; attended and silent/Intune installs. The daily time comes from the Team
+; Activity wizard page (GetTeamActivityParams; /TEAMTIME= for silent installs,
+; default 08:00). The task no-ops until analytics_orgs is set in config.json,
+; so registering it now is harmless.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "{code:GetTeamActivityParams}"; \
     Flags: runhidden; \
     StatusMsg: "Scheduling daily Team Activity collection..."
 
@@ -203,6 +202,7 @@ var
   IntervalDetailPage: TInputQueryWizardPage;
   TeamActivityPage:   TWizardPage;
   TeamMemo:           TNewMemo;
+  TeamTimeEdit:       TNewEdit;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
@@ -242,6 +242,7 @@ procedure InitializeWizard;
 var
   ConsentText: TArrayOfString;
   TeamActivityLabel: TNewStaticText;
+  TeamTimeLabel: TNewStaticText;
 begin
   { Load the consent file shipped in [Files]; if missing, fall back to inline.}
   if not LoadStringsFromFile(ExpandConstant('{tmp}\CONSENT.txt'), ConsentText) then
@@ -340,10 +341,27 @@ begin
     'Team Activity (optional)',
     'Collect claude.ai per-user admin analytics for your organizations');
 
+  { Daily collection time. Team Activity always runs once a day (it collects
+    the previous complete day), so only the time of day is configurable here.
+    Written into the ClaudeTeamActivityDaily scheduled task by GetTeamActivityParams. }
+  TeamTimeLabel := TNewStaticText.Create(TeamActivityPage);
+  TeamTimeLabel.Parent := TeamActivityPage.Surface;
+  TeamTimeLabel.Left := 0;
+  TeamTimeLabel.Top := 2;
+  TeamTimeLabel.AutoSize := True;
+  TeamTimeLabel.Caption := 'Daily collection time (HH:MM, 24-hour) - runs once a day:';
+
+  TeamTimeEdit := TNewEdit.Create(TeamActivityPage);
+  TeamTimeEdit.Parent := TeamActivityPage.Surface;
+  TeamTimeEdit.Left := 0;
+  TeamTimeEdit.Top := 20;
+  TeamTimeEdit.Width := 90;
+  TeamTimeEdit.Text := '08:00';
+
   TeamActivityLabel := TNewStaticText.Create(TeamActivityPage);
   TeamActivityLabel.Parent := TeamActivityPage.Surface;
   TeamActivityLabel.Left := 0;
-  TeamActivityLabel.Top := 0;
+  TeamActivityLabel.Top := 52;
   TeamActivityLabel.Width := TeamActivityPage.SurfaceWidth;
   TeamActivityLabel.AutoSize := False;
   TeamActivityLabel.Height := 90;
@@ -360,9 +378,9 @@ begin
   TeamMemo := TNewMemo.Create(TeamActivityPage);
   TeamMemo.Parent := TeamActivityPage.Surface;
   TeamMemo.Left := 0;
-  TeamMemo.Top := 96;
+  TeamMemo.Top := 148;
   TeamMemo.Width := TeamActivityPage.SurfaceWidth;
-  TeamMemo.Height := TeamActivityPage.SurfaceHeight - 96;
+  TeamMemo.Height := TeamActivityPage.SurfaceHeight - 148;
   TeamMemo.ScrollBars := ssVertical;
   TeamMemo.WordWrap := True;
 end;
@@ -550,6 +568,34 @@ begin
             ' --unit ' + unitStr + ' --at ' + atTime + ' --fleet';
 end;
 
+{ Build the collector argument string for the DAILY team-activity task from the
+  Team Activity wizard page's time field. /TEAMTIME= overrides for silent
+  installs; falls back to 08:00. Team Activity is always daily. }
+function GetTeamActivityParams(Param: String): String;
+var
+  atTime: String;
+begin
+  atTime := Trim(GetCmdLineParam('TEAMTIME'));
+  if (atTime = '') and (TeamTimeEdit <> nil) then
+    atTime := Trim(TeamTimeEdit.Text);
+  if atTime = '' then atTime := '08:00';
+  Result := 'team-activity --install-task --every 1 --unit days --at '
+            + atTime + ' --fleet';
+end;
+
+{ True if s is a valid HH:MM 24-hour time. }
+function IsValidHHMM(s: String): Boolean;
+var
+  p, hh, mm: Integer;
+begin
+  Result := False;
+  p := Pos(':', s);
+  if p < 2 then Exit;
+  hh := StrToIntDef(Copy(s, 1, p - 1), -1);
+  mm := StrToIntDef(Copy(s, p + 1, Length(s)), -1);
+  Result := (hh >= 0) and (hh <= 23) and (mm >= 0) and (mm <= 59);
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   url: String;
@@ -590,6 +636,12 @@ begin
     page is fine (skipped). }
   if (TeamActivityPage <> nil) and (CurPageID = TeamActivityPage.ID) then
   begin
+    if not IsValidHHMM(Trim(TeamTimeEdit.Text)) then
+    begin
+      MsgBox('Enter the daily collection time as HH:MM (24-hour), e.g. 08:00.',
+             mbError, MB_OK);
+      Result := False; Exit;
+    end;
     teamCount := GetTeamRecords(teamRecs);
     for n := 0 to teamCount - 1 do
     begin
