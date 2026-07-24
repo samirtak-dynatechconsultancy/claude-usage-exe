@@ -305,14 +305,18 @@ def _valid_orgs(cfg: Dict) -> List[dict]:
 
 def _collect_one_day(cfg: Dict, entry: dict, day: date,
                      no_push: bool) -> bool:
-    """Collect + push a single calendar `day` for one org. Window is
-    [day, day+1) so the numbers are that day's activity alone. snapshot_date =
-    day. Returns True on success."""
+    """Collect + push a single calendar `day` for one org.
+
+    The window is start_date == end_date == day. claude.ai treats end_date as
+    INCLUSIVE, so [day, day+1] would cover TWO days (day and day+1); summing
+    such overlapping windows across a backfill double-counts everything (and
+    inflates days-active). [day, day] returns exactly that one day.
+    snapshot_date = day. Returns True on success."""
     org = (entry.get("org") or "").strip()
     org_name = entry.get("org_name") or org
     cookie = entry.get("cookie") or ""
     start = day.isoformat()
-    end = (day + timedelta(days=1)).isoformat()
+    end = day.isoformat()   # inclusive end -> same day = exactly one day
 
     ok, err, members = True, None, []
     try:

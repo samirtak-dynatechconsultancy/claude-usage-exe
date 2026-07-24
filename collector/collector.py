@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.9.10"
+USER_AGENT = "claude-usage-collector/1.9.11"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
