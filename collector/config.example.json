@@ -22,7 +22,11 @@
     }
   ],
 
-  "_comment_5": "analytics_days_back = which single day the daily Team Activity run collects, as days back from today. 1 = yesterday. Each run stores ONE day of per-user activity (window [day, day+1)) under that day's date. Must be >= 1: claude.ai rejects a same-day/future date with HTTP 400 and only a completed day has settled data. To load history run `ClaudeUsageCollector.exe team-activity --backfill 30` (last 30 days, one by one); add --reset to wipe first.",
+  "_comment_5": "analytics_days_back = which single day `--date`-less single-day collection targets, as days back from today. 1 = yesterday. claude.ai rejects today/future (HTTP 400) and only a completed day has settled data. To load history run `ClaudeUsageCollector.exe team-activity --backfill 30`; add --reset to wipe first.",
 
-  "analytics_days_back": 1
+  "analytics_days_back": 1,
+
+  "_comment_6": "analytics_catchup_days = how many recent days a plain daily run tops up each time (idempotent upsert), so if the machine was off/offline for a couple days the gap self-heals instead of being lost. Default 3. Set to 1 for strict yesterday-only.",
+
+  "analytics_catchup_days": 3
 }

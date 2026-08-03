@@ -26,6 +26,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlrequest
@@ -68,8 +69,41 @@ MAX_PAGES = 1000         # safety cap only; real stop is an empty members array
 # completed day has settled data. Overridable via config "analytics_days_back"
 # or the --date CLI flag.
 DEFAULT_DAYS_BACK = 1
+# A plain daily run tops up the last N days (idempotent upsert), so a short
+# offline/failed stretch self-heals instead of leaving a gap. Overridable via
+# config "analytics_catchup_days"; set to 1 for strict yesterday-only.
+DEFAULT_CATCHUP_DAYS = 3
+# Retry transient failures (DNS not-ready right after wake, connection reset,
+# Cloudflare 403/503, non-JSON challenge). Backoff: 5, 10, 20, 40 s.
+RETRY_TRIES = 5
+RETRY_BACKOFF = 5
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _get_json(url: str, cookie: str) -> dict:
+    """GET + parse JSON, retrying transient failures with backoff. Raises the
+    last error if all attempts fail. HTTP 400/401 are permanent (raised at once);
+    403/408/429/5xx, network errors, and non-JSON responses are retried."""
+    last = None
+    for attempt in range(RETRY_TRIES):
+        try:
+            req = urlrequest.Request(url, headers={
+                "Cookie": cookie, "User-Agent": _UA,
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://claude.ai/"})
+            with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                raw = resp.read()
+            return json.loads(raw)
+        except HTTPError as e:
+            last = e
+            if e.code in (400, 401):   # permanent -- don't retry
+                raise
+        except (URLError, OSError, ValueError) as e:
+            last = e
+        if attempt < RETRY_TRIES - 1:
+            time.sleep(RETRY_BACKOFF * (2 ** attempt))
+    raise last
 
 
 # Logging: collector.py injects its log() here so team-activity runs land in
@@ -94,20 +128,7 @@ def _fetch_page(org: str, cookie: str, start_date: str, end_date: str,
     qs = (f"?page={page}&page_size={PAGE_SIZE}&sort=chats&order=desc"
           f"&start_date={start_date}&end_date={end_date}")
     url = CLAUDE_AI_BASE + ACTIVITY_EP.format(org=org) + qs
-    req = urlrequest.Request(url, headers={
-        "Cookie": cookie,
-        "User-Agent": _UA,
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://claude.ai/",
-    })
-    with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        raw = resp.read()
-    try:
-        return json.loads(raw)
-    except ValueError:
-        # Non-JSON (usually a Cloudflare challenge HTML page).
-        raise ValueError("claude.ai returned a non-JSON response "
-                         "(likely a Cloudflare challenge -- refresh the cookie)")
+    return _get_json(url, cookie)
 
 
 def _member_key(m: dict, page: int, idx: int) -> str:
@@ -168,17 +189,25 @@ def _push(cfg: Dict, payload: Dict) -> Tuple[bool, str]:
         return False, "server_url/ingest_token not in config"
 
     body = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        f"{server_url}/api/ingest", data=body, method="POST",
-        headers={"X-Ingest-Token": token, "Content-Type": "application/json"})
-    try:
-        with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            resp_body = json.loads(resp.read())
-        return bool(resp_body.get("ok")), json.dumps(resp_body)
-    except HTTPError as e:
-        return False, f"HTTP {e.code}: {e.read()[:200]!r}"
-    except (URLError, ValueError, OSError) as e:
-        return False, str(e)
+    url = f"{server_url}/api/ingest"
+    headers = {"X-Ingest-Token": token, "Content-Type": "application/json"}
+    last = None
+    for attempt in range(RETRY_TRIES):
+        try:
+            req = urlrequest.Request(url, data=body, method="POST", headers=headers)
+            with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                resp_body = json.loads(resp.read())
+            return bool(resp_body.get("ok")), json.dumps(resp_body)
+        except HTTPError as e:
+            # 4xx (except 408/429) is permanent -- our bug/auth, not transient.
+            if 400 <= e.code < 500 and e.code not in (408, 429):
+                return False, f"HTTP {e.code}: {e.read()[:200]!r}"
+            last = e
+        except (URLError, OSError, ValueError) as e:
+            last = e
+        if attempt < RETRY_TRIES - 1:
+            time.sleep(RETRY_BACKOFF * (2 ** attempt))
+    return False, str(last)
 
 
 def fetch_roster(org: str, cookie: str) -> List[dict]:
@@ -186,17 +215,7 @@ def fetch_roster(org: str, cookie: str) -> List[dict]:
     who have never been active (no activity rows). Each entry:
     {uuid, email, name, role, seat_tier, created_at}."""
     url = CLAUDE_AI_BASE + MEMBERS_EP.format(org=org)
-    req = urlrequest.Request(url, headers={
-        "Cookie": cookie, "User-Agent": _UA,
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://claude.ai/",
-    })
-    with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        raw = resp.read()
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        raise ValueError("non-JSON /members response (Cloudflare challenge?)")
+    data = _get_json(url, cookie)
     out = []
     for m in (data or []):
         if not isinstance(m, dict):

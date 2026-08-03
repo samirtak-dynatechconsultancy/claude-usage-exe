@@ -15,7 +15,7 @@
 ; pre-filled with command-line values if provided.
 
 #define MyAppName       "Claude Code Usage Collector"
-#define MyAppVersion    "1.9.11"
+#define MyAppVersion    "1.9.12"
 #define MyAppPublisher  "Internal"
 #define MyAppExeName    "ClaudeUsageCollector.exe"
 #define MyTrayExeName   "ClaudeUsageTray.exe"
@@ -537,6 +537,7 @@ begin
     '  "upload_content": ' + uploadContentStr + ',' + #13#10 +
     '  "projects_dirs":  null,' + #13#10 +
     '  "analytics_days_back": 1,' + #13#10 +
+    '  "analytics_catchup_days": 3,' + #13#10 +
     analyticsBlock + #13#10 +
     '}' + #13#10;
   SaveStringToFile(configPath, contents, False);

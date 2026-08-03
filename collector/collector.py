@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.9.11"
+USER_AGENT = "claude-usage-collector/1.9.12"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -1300,7 +1300,20 @@ def cmd_team_activity(args):
         code |= team_activity.collect_and_push(cfg, day=args.date,
                                                no_push=args.no_push)
     elif not did:
-        code |= team_activity.collect_and_push(cfg, no_push=args.no_push)
+        # Plain daily run: top up the last few days (idempotent) so a short
+        # offline/failed stretch self-heals. analytics_catchup_days=1 => strict
+        # yesterday-only.
+        catchup = cfg.get("analytics_catchup_days",
+                          team_activity.DEFAULT_CATCHUP_DAYS)
+        try:
+            catchup = max(1, int(catchup))
+        except (TypeError, ValueError):
+            catchup = team_activity.DEFAULT_CATCHUP_DAYS
+        if catchup <= 1:
+            code |= team_activity.collect_and_push(cfg, no_push=args.no_push)
+        else:
+            code |= team_activity.backfill(cfg, days=catchup,
+                                           no_push=args.no_push)
     if code:
         sys.exit(code)
 
