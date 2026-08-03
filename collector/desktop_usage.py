@@ -337,17 +337,35 @@ def get_session_cookie() -> str:
 # API helpers
 # ---------------------------------------------------------------------------
 
-def _api_get(path: str, cookie: str):
+def _api_get(path: str, cookie: str, tries: int = 3):
+    """GET + parse JSON, retrying transient failures with backoff. claude.ai's
+    standalone Desktop-usage requests get intermittently Cloudflare-403'd, so a
+    couple of retries often recover. 400/401/404 are permanent (raised at once);
+    403/408/429/5xx + network errors are retried. `tries=1` disables retry (used
+    when probing orgs, where a 403 usually just means 'no plan on this org')."""
     url = CLAUDE_AI_BASE + path
-    req = urlrequest.Request(url, headers={
+    headers = {
         "Cookie": f"sessionKey={cookie}",
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/131.0.0.0 Safari/537.36"),
         "Accept": "application/json",
-    })
-    with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return json.loads(resp.read())
+    }
+    last = None
+    for attempt in range(max(1, tries)):
+        try:
+            req = urlrequest.Request(url, headers=headers)
+            with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except HTTPError as e:
+            last = e
+            if e.code in (400, 401, 404):
+                raise
+        except (URLError, OSError, ValueError) as e:
+            last = e
+        if attempt < max(1, tries) - 1:
+            time.sleep(3 * (2 ** attempt))   # 3, 6 s
+    raise last
 
 
 def _resolve_org(cookie: str) -> Tuple[str, dict]:
@@ -360,7 +378,8 @@ def _resolve_org(cookie: str) -> Tuple[str, dict]:
         if not uuid:
             continue
         try:
-            usage = _api_get(USAGE_EP.format(org_uuid=uuid), cookie)
+            # tries=1: a 403 here just means this org has no plan -> skip fast.
+            usage = _api_get(USAGE_EP.format(org_uuid=uuid), cookie, tries=1)
             if usage.get("five_hour", {}).get("utilization") is not None:
                 return uuid, org
         except (HTTPError, URLError):

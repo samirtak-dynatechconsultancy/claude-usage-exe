@@ -48,7 +48,7 @@ _identify_state = {"checked": False, "mapped": None, "client_machine": None}
 _identify_lock  = None   # threading.Lock instance, created in main()
 
 # ── Auto-update ────────────────────────────────────────────────────────────
-CURRENT_VERSION = "1.9.12"   # bumped on every release; ground truth for comparisons
+CURRENT_VERSION = "1.9.13"   # bumped on every release; ground truth for comparisons
 RELEASES_API_URL = (
     "https://api.github.com/repos/samirtak-dynatechconsultancy/claude-usage-exe/releases/latest"
 )

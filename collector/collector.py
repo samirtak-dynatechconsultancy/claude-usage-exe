@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 # ── Constants ───────────────────────────────────────────────────────────────
 
 APP_NAME = "ClaudeUsageCollector"
-USER_AGENT = "claude-usage-collector/1.9.12"
+USER_AGENT = "claude-usage-collector/1.9.13"
 DAEMON_SLEEP_SECONDS = 900   # 15 minutes between pushes in daemon mode
 IDENTITY_POLL_S = 30          # poll RDP identity every 30 seconds between pushes
 DAEMON_LOCK_FILENAME = "daemon.lock"
@@ -1239,7 +1239,16 @@ def cmd_usage(args):
         # None of these are a crash -- skip quietly and move on.
         print(f"usage: skipped - {str(e).splitlines()[0]}")
         return
-    data = read_usage(cookie)
+
+    # read_usage() calls claude.ai; it can fail with HTTP 403 (Cloudflare
+    # intermittently blocks standalone requests), a network error, or bad JSON.
+    # Desktop subscription % is a best-effort secondary metric, so a failed read
+    # is a clean skip, not a crash-with-traceback.
+    try:
+        data = read_usage(cookie)
+    except (HTTPError, URLError, OSError, ValueError) as e:
+        print(f"usage: skipped - {str(e).splitlines()[0]}")
+        return
     print_usage(data)
 
     base = str(_exe_dir())
